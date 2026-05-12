@@ -50,12 +50,17 @@ def _owner_abbreviation(full_name: str) -> str:
     return full_name
 
 
+RED_FILL = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
+
+
 def contract_to_row(data: ContractData) -> list:
     contract_str = data.contract_number
     if data.contract_date:
         contract_str += f" от {data.contract_date}"
 
     owner = _owner_abbreviation(data.customer_short_name)
+
+    qty_value = data.quantity_all_values if data.quantity_mismatch else data.quantity_packages
 
     return [
         owner,
@@ -67,7 +72,7 @@ def contract_to_row(data: ContractData) -> list:
         data.trade_name,
         data.dosage_form,
         data.unit,
-        data.quantity_packages,
+        qty_value,
         data.manufacturer,
         data.unit_price,
         data.total_price,
@@ -180,6 +185,9 @@ def write_contracts_to_excel(
             for col_idx, value in enumerate(row_data, 1):
                 ws.cell(row=row_num, column=col_idx, value=value)
             _apply_data_style(ws, row_num)
+            if contract.quantity_mismatch:
+                qty_cell = ws.cell(row=row_num, column=10)
+                qty_cell.fill = RED_FILL
             written += 1
 
         save_path = str(path)
