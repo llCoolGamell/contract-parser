@@ -315,6 +315,8 @@ class ContractParser:
                 data.dosage_form_mnn_only = True
             if qty_per_consumer > 0:
                 dosage_text += f" \u2116{qty_per_consumer}"
+            if completeness and completeness != "~":
+                dosage_text += f", {completeness}"
             data.dosage_form = dosage_text
         elif mnn_object:
             data.dosage_form = mnn_object
