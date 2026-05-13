@@ -6,6 +6,7 @@
 
 import sys
 import os
+import subprocess
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -583,6 +584,29 @@ class MainWindow(QMainWindow):
         )
         right_layout.addWidget(self.log_area)
 
+        self.btn_open_excel = QPushButton("📂 Открыть Excel")
+        self.btn_open_excel.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+            }
+        """
+        )
+        self.btn_open_excel.clicked.connect(self.open_excel)
+        right_layout.addWidget(self.btn_open_excel)
+
         right_layout.addStretch()
         main_layout.addWidget(right_group, stretch=2)
 
@@ -641,6 +665,33 @@ class MainWindow(QMainWindow):
             if not path.endswith(".xlsx"):
                 path += ".xlsx"
             self.new_path_edit.setText(path)
+
+    def open_excel(self) -> None:
+        excel_path = ""
+        if self.radio_existing.isChecked():
+            excel_path = self.excel_path_edit.text().strip()
+        else:
+            excel_path = self.new_path_edit.text().strip()
+
+        if not excel_path or not Path(excel_path).exists():
+            QMessageBox.warning(
+                self,
+                "Файл не найден",
+                "Сначала укажите или создайте Excel файл.",
+            )
+            return
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(excel_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", excel_path])
+            else:
+                subprocess.Popen(["xdg-open", excel_path])
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Ошибка", f"Не удалось открыть файл: {e}"
+            )
 
     def log(self, message: str) -> None:
         self.log_area.append(message)

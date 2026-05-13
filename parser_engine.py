@@ -303,20 +303,22 @@ class ContractParser:
         elif total_qty > 0:
             data.quantity_packages = total_qty
 
-        # --- 3) Лек. форма: ONLY from "Наименование объекта закупки", NOT ГРЛС ---
-        if mnn_object:
-            dosage_text = mnn_object
-            if mnn_grls:
-                pattern = re.compile(re.escape(mnn_grls), re.IGNORECASE)
-                cleaned = pattern.sub("", dosage_text).strip()
-                cleaned = re.sub(r'^[\s,;:\-]+|[\s,;:\-]+$', '', cleaned).strip()
-                if cleaned:
-                    dosage_text = cleaned
-                else:
-                    data.dosage_form_mnn_only = True
+        # --- 3) Лек. форма: from ГРЛС, strip МНН (part before colon) ---
+        if grls_form:
+            parts = grls_form.split(":", 1)
+            if len(parts) == 2:
+                dosage_text = parts[1].strip()
+            else:
+                dosage_text = grls_form.strip()
+            if not dosage_text:
+                dosage_text = grls_form
+                data.dosage_form_mnn_only = True
             if qty_per_consumer > 0:
                 dosage_text += f" \u2116{qty_per_consumer}"
             data.dosage_form = dosage_text
+        elif mnn_object:
+            data.dosage_form = mnn_object
+            data.dosage_form_mnn_only = True
 
         # Extract trade name (part before comma or registration number)
         if trade_name_raw:
