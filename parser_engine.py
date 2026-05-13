@@ -315,7 +315,7 @@ class ContractParser:
                 data.dosage_form_mnn_only = True
             if qty_per_consumer > 0:
                 if "мл" in dosage_text.lower():
-                    dosage_text += f" {qty_per_consumer} мл"
+                    dosage_text += f" {qty_per_consumer} мл №1"
                 else:
                     dosage_text += f" №{qty_per_consumer}"
             if completeness and completeness != "~":
