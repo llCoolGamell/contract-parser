@@ -51,6 +51,8 @@ def _owner_abbreviation(full_name: str) -> str:
 
 
 RED_FILL = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
+BLUE_FILL = PatternFill(start_color="6699FF", end_color="6699FF", fill_type="solid")
+YELLOW_FILL = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
 
 
 def contract_to_row(data: ContractData) -> list:
@@ -179,6 +181,8 @@ def write_contracts_to_excel(
 
         # Write contracts
         written = 0
+        qty_mismatch_rows = []
+        dosage_mnn_only_rows = []
         for contract in contracts:
             row_data = contract_to_row(contract)
             row_num = last_row + 1 + written
@@ -186,16 +190,48 @@ def write_contracts_to_excel(
                 ws.cell(row=row_num, column=col_idx, value=value)
             _apply_data_style(ws, row_num)
             if contract.quantity_mismatch:
-                qty_cell = ws.cell(row=row_num, column=10)
-                qty_cell.fill = RED_FILL
+                qty_mismatch_rows.append(row_num)
+            if contract.dosage_form_mnn_only:
+                dosage_mnn_only_rows.append(row_num)
             written += 1
+
+        # Check for duplicate rows in the entire sheet
+        all_rows = {}
+        duplicate_rows = set()
+        for row_num in range(2, ws.max_row + 1):
+            row_values = tuple(
+                ws.cell(row=row_num, column=col).value
+                for col in range(1, len(HEADERS) + 1)
+            )
+            if row_values in all_rows:
+                duplicate_rows.add(row_num)
+                duplicate_rows.add(all_rows[row_values])
+            else:
+                all_rows[row_values] = row_num
+
+        has_duplicates = len(duplicate_rows) > 0
+        if has_duplicates:
+            for row_num in duplicate_rows:
+                for col_idx in range(1, len(HEADERS) + 1):
+                    ws.cell(row=row_num, column=col_idx).fill = BLUE_FILL
+
+        # Apply red fill for quantity mismatches (on top of blue if needed)
+        for row_num in qty_mismatch_rows:
+            ws.cell(row=row_num, column=10).fill = RED_FILL
+
+        # Apply yellow fill for dosage_form with MNN only
+        for row_num in dosage_mnn_only_rows:
+            ws.cell(row=row_num, column=8).fill = YELLOW_FILL
 
         save_path = str(path)
         if not save_path.endswith(".xlsx"):
             save_path = save_path.rsplit(".", 1)[0] + ".xlsx"
 
         wb.save(save_path)
-        return True, f"Записано {written} контракт(ов) в {save_path}"
+        msg = f"Записано {written} контракт(ов) в {save_path}"
+        if has_duplicates:
+            msg += "\n\nПри выгрузке обнаружены дубли (выделены синим цветом)"
+        return True, msg
 
     except PermissionError:
         return False, (
