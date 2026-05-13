@@ -235,6 +235,17 @@ class ProcessThread(QThread):
         self.sheet_name = sheet_name
 
     def run(self) -> None:
+        try:
+            self._do_run()
+        except Exception as e:
+            self.finished_signal.emit(
+                False,
+                f"Критическая ошибка: {e}",
+                [str(e)],
+                [],
+            )
+
+    def _do_run(self) -> None:
         parser = ContractParser()
         contracts: list[ContractData] = []
         errors: list[str] = []
