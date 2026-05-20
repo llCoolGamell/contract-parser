@@ -258,13 +258,17 @@ class ProcessThread(QThread):
                 f"Обработка: {Path(fp).name}",
             )
             try:
-                result = parser.parse_file(fp)
-                if result:
-                    if result.errors:
-                        for err in result.errors:
-                            errors.append(f"{Path(fp).name}: {err}")
-                    if result.contract_number:
-                        contracts.append(result)
+                results = parser.parse_file(fp)
+                if results:
+                    has_valid = False
+                    for result in results:
+                        if result.errors:
+                            for err in result.errors:
+                                errors.append(f"{Path(fp).name}: {err}")
+                        if result.contract_number:
+                            contracts.append(result)
+                            has_valid = True
+                    if has_valid:
                         successful_paths.append(fp)
                     else:
                         errors.append(
