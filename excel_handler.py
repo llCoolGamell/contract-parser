@@ -53,6 +53,7 @@ def _owner_abbreviation(full_name: str) -> str:
 RED_FILL = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
 BLUE_FILL = PatternFill(start_color="6699FF", end_color="6699FF", fill_type="solid")
 YELLOW_FILL = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+ORANGE_FILL = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
 
 
 def contract_to_row(data: ContractData) -> list:
@@ -183,6 +184,7 @@ def write_contracts_to_excel(
         written = 0
         qty_mismatch_rows = []
         dosage_mnn_only_rows = []
+        dosage_empty_rows = []
         for contract in contracts:
             row_data = contract_to_row(contract)
             row_num = last_row + 1 + written
@@ -193,6 +195,8 @@ def write_contracts_to_excel(
                 qty_mismatch_rows.append(row_num)
             if contract.dosage_form_mnn_only:
                 dosage_mnn_only_rows.append(row_num)
+            if contract.dosage_form_empty:
+                dosage_empty_rows.append(row_num)
             written += 1
 
         # Check for duplicate rows in the entire sheet
@@ -222,6 +226,10 @@ def write_contracts_to_excel(
         # Apply yellow fill for dosage_form with MNN only
         for row_num in dosage_mnn_only_rows:
             ws.cell(row=row_num, column=8).fill = YELLOW_FILL
+
+        # Apply orange fill for empty dosage_form (ПУСТО — незарегистрированный препарат)
+        for row_num in dosage_empty_rows:
+            ws.cell(row=row_num, column=8).fill = ORANGE_FILL
 
         save_path = str(path)
         if not save_path.endswith(".xlsx"):
