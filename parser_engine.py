@@ -475,7 +475,7 @@ class ContractParser:
     def _extract_object_info(self, texts: list[str], data: ContractData) -> None:
         for i, t in enumerate(texts):
             if t == "Итого:" and i + 1 < len(texts):
-                price_str = texts[i + 1].replace(" ", "").replace(" ", "").replace(",", ".")
+                price_str = texts[i + 1].replace(" ", "").replace("\u00a0", "").replace(",", ".")
                 try:
                     data.total_price = float(price_str)
                 except ValueError:
@@ -483,10 +483,25 @@ class ContractParser:
                 break
 
     def _parse_qty_str(self, s: str) -> float:
-        cleaned = re.sub(r"[^\d.,]", "", s.replace(" ", "").replace(" ", ""))
-        cleaned = cleaned.replace(",", ".")
+        """
+        Извлекает первое число из начала строки.
+        Примеры:
+        - "15120 Кубический сантиметр; миллилитр (СМ3; МЛ)" -> 15120.0
+        - "15 483 859.20" -> 15483859.20
+        - "1 024,06476190476" -> 1024.06476190476
+        - "2 799 960.30" -> 2799960.30
+        """
+        if not s:
+            return 0.0
+        # Нормализуем неразрывные пробелы
+        normalized = s.replace("\u00a0", " ").strip()
+        # Берём подстроку с начала: цифры, пробелы, точка/запятая
+        match = re.match(r"^\s*([\d][\d\s]*(?:[.,]\d+)?)", normalized)
+        if not match:
+            return 0.0
+        num_str = match.group(1).replace(" ", "").replace(",", ".")
         try:
-            return float(cleaned)
+            return float(num_str)
         except ValueError:
             return 0.0
 
