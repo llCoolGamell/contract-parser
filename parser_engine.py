@@ -24,6 +24,7 @@ class ContractData:
     trade_name: str = ""
     dosage_form: str = ""
     dosage_form_mnn_only: bool = False
+    dosage_form_empty: bool = False
     unit: str = "упак."
     quantity_packages: float = 0.0
     quantity_mismatch: bool = False
@@ -223,8 +224,19 @@ class ContractParser:
                 t = texts[idx]
 
                 if t == "МНН и форма выпуска в соответствии с ГРЛС" and idx + 1 < section_end:
-                    entry["grls_form"] = texts[idx + 1]
-                    idx += 2
+                    next_val = texts[idx + 1]
+                    # Если следующий текст — заголовок, а не значение (препарат не зарегистрирован)
+                    if next_val in (
+                        "Наименование держателя или владельца РУ",
+                        "Производитель",
+                        "Количество лекарственных форм в первичной упаковке",
+                        "Признак включения в ЖНВЛП",
+                    ):
+                        entry["grls_form"] = ""
+                        idx += 1
+                    else:
+                        entry["grls_form"] = next_val
+                        idx += 2
                 elif t == "Наименование держателя или владельца РУ" and idx + 1 < section_end:
                     entry["holder"] = texts[idx + 1]
                     idx += 2
@@ -256,9 +268,7 @@ class ContractParser:
                         pass
                     idx += 2
                 elif t == "Комплектность потребительской упаковки" and idx + 1 < section_end:
-                    val = texts[idx + 1].strip()
-                    if val and val != "~":
-                        entry["completeness"] = val
+                    entry["completeness"] = texts[idx + 1]
                     idx += 2
                 elif t == "Признак включения в ЖНВЛП" and idx + 1 < section_end:
                     idx += 2
@@ -295,7 +305,6 @@ class ContractParser:
 
             grls_form = entry["grls_form"]
             obj_num = entry["obj_num"]
-            completeness = entry.get("completeness", "")
 
             # --- MNN ---
             mnn_grls = ""
@@ -322,8 +331,11 @@ class ContractParser:
             elif mnn_object:
                 data.mnn = mnn_object
 
-            # --- Dosage form: <форма> [+ qty мл] [+ комплектность] + №X ---
+            # --- Dosage form from ГРЛС (strip MNN before colon) + №X ---
             qty_per_consumer = entry["qty_per_consumer"]
+            completeness = entry.get("completeness", "")
+            completeness_suffix = f" , {completeness}" if (completeness and completeness != "~") else ""
+
             if grls_form:
                 parts = grls_form.split(":", 1)
                 if len(parts) == 2:
@@ -333,26 +345,20 @@ class ContractParser:
                 if not dosage_text:
                     dosage_text = grls_form
                     data.dosage_form_mnn_only = True
-
-                body = dosage_text
-                num_part = ""
                 if qty_per_consumer > 0:
                     if "мл" in dosage_text.lower():
-                        body = f"{dosage_text} {qty_per_consumer} мл"
-                        num_part = "№1"
+                        dosage_text += f" {qty_per_consumer} мл{completeness_suffix} №1"
                     else:
-                        num_part = f"№{qty_per_consumer}"
-
-                if completeness:
-                    body = f"{body}, {completeness}"
-
-                if num_part:
-                    data.dosage_form = f"{body} {num_part}"
-                else:
-                    data.dosage_form = body
+                        dosage_text += f"{completeness_suffix} №{qty_per_consumer}"
+                elif completeness_suffix:
+                    dosage_text += completeness_suffix
+                data.dosage_form = dosage_text
             elif mnn_object:
                 data.dosage_form = mnn_object
                 data.dosage_form_mnn_only = True
+            else:
+                data.dosage_form = "ПУСТО"
+                data.dosage_form_empty = True
 
             # --- Trade name ---
             trade_name_raw = entry["trade_name_raw"]
@@ -587,7 +593,14 @@ class ContractParser:
                         break
 
             if "МНН и форма выпуска в соответствии с ГРЛС" in t and i + 1 < len(section_texts):
-                grls_form = section_texts[i + 1]
+                next_val = section_texts[i + 1]
+                if next_val not in (
+                    "Наименование держателя или владельца РУ",
+                    "Производитель",
+                    "Количество лекарственных форм в первичной упаковке",
+                    "Признак включения в ЖНВЛП",
+                ):
+                    grls_form = next_val
 
             if t == "Наименование держателя или владельца РУ" and i + 1 < len(section_texts):
                 holder = section_texts[i + 1]
@@ -661,13 +674,14 @@ class ContractParser:
             if not dosage_text:
                 dosage_text = grls_form
                 data.dosage_form_mnn_only = True
+            completeness_suffix = f" , {completeness}" if (completeness and completeness != "~") else ""
             if qty_per_consumer > 0:
                 if "мл" in dosage_text.lower():
-                    dosage_text += f" {qty_per_consumer} мл №1"
+                    dosage_text += f" {qty_per_consumer} мл{completeness_suffix} №1"
                 else:
-                    dosage_text += f" №{qty_per_consumer}"
-            if completeness and completeness != "~":
-                dosage_text += f", {completeness}"
+                    dosage_text += f"{completeness_suffix} №{qty_per_consumer}"
+            elif completeness_suffix:
+                dosage_text += completeness_suffix
             data.dosage_form = dosage_text
         elif mnn_object:
             data.dosage_form = mnn_object
