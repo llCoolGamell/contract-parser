@@ -195,7 +195,7 @@ class ContractParser:
                 idx += 1
                 continue
 
-         entry = {
+            entry = {
                 "row_num": row_num,
                 "obj_num": obj_num,
                 "trade_name_raw": texts[idx + 2],
@@ -209,7 +209,6 @@ class ContractParser:
                 "qty_primary_per_consumer": 0,
                 "qty_per_consumer": 0,
                 "total_qty": 0,
-                "completeness": "",
             }
 
             try:
@@ -255,10 +254,7 @@ class ContractParser:
                     except ValueError:
                         pass
                     idx += 2
-               elif t == "Комплектность потребительской упаковки" and idx + 1 < section_end:
-                    val = texts[idx + 1].strip()
-                    if val and val != "~":
-                        entry["completeness"] = val
+                elif t == "Комплектность потребительской упаковки" and idx + 1 < section_end:
                     idx += 2
                 elif t == "Признак включения в ЖНВЛП" and idx + 1 < section_end:
                     idx += 2
@@ -295,7 +291,6 @@ class ContractParser:
 
             grls_form = entry["grls_form"]
             obj_num = entry["obj_num"]
-            completeness = entry.get("completeness", "")
 
             # --- MNN ---
             mnn_grls = ""
@@ -322,7 +317,7 @@ class ContractParser:
             elif mnn_object:
                 data.mnn = mnn_object
 
-             # --- Dosage form: <форма> [+ qty мл] [+ комплектность] + №X ---
+            # --- Dosage form from ГРЛС (strip MNN before colon) + №X ---
             qty_per_consumer = entry["qty_per_consumer"]
             if grls_form:
                 parts = grls_form.split(":", 1)
@@ -333,23 +328,12 @@ class ContractParser:
                 if not dosage_text:
                     dosage_text = grls_form
                     data.dosage_form_mnn_only = True
-
-                body = dosage_text
-                num_part = ""
                 if qty_per_consumer > 0:
                     if "мл" in dosage_text.lower():
-                        body = f"{dosage_text} {qty_per_consumer} мл"
-                        num_part = "№1"
+                        dosage_text += f" {qty_per_consumer} мл №1"
                     else:
-                        num_part = f"№{qty_per_consumer}"
-
-                if completeness:
-                    body = f"{body}, {completeness}"
-
-                if num_part:
-                    data.dosage_form = f"{body} {num_part}"
-                else:
-                    data.dosage_form = body
+                        dosage_text += f" №{qty_per_consumer}"
+                data.dosage_form = dosage_text
             elif mnn_object:
                 data.dosage_form = mnn_object
                 data.dosage_form_mnn_only = True
