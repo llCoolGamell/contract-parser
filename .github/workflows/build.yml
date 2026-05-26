@@ -27,7 +27,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --windowed --name ContractParser --icon=NONE --paths . --hidden-import=parser_engine --hidden-import=excel_handler main.py
+          pyinstaller --onefile --windowed --name ContractParser --icon=NONE main.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
