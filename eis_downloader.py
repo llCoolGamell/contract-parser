@@ -2,7 +2,7 @@
 """
 Скачивание контрактов с ЕИС (zakupki.gov.ru) по номеру.
 Ищет в реестре контрактов по любому номеру (реестровый/извещение/ИКЗ/внутренний),
-скачивает «Печатную форму электронного контракта» (HTML) и PDF контракта.
+скачивает «Печатную форму электронного контракта» (HTML, самая свежая версия) и PDF контракта.
 
 Тест доступа:      python eis_downloader.py test
 Скачать контракты: python eis_downloader.py "C:\\папка" 01085-ФЛ/2026 2745313582726000543
@@ -22,6 +22,9 @@ BASE = "https://zakupki.gov.ru"
 SEARCH_URL = BASE + "/epz/contract/search/results.html"
 DOCS_URL = BASE + "/epz/contract/contractCard/document-info.html"
 PRINTFORM_URL = BASE + "/epz/contract/printForm/view.html"
+
+# Маркер настоящей печатной формы электронного контракта (её ест парсер)
+ECONTRACT_MARKER = "Электронный контракт, сформированный с использованием ЕИС"
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -57,6 +60,11 @@ def _norm(s):
     return re.sub(r"[^0-9a-zа-я]", "", (s or "").lower())
 
 
+def _plain_text(html):
+    soup = BeautifulSoup(html, "lxml")
+    return " ".join(soup.get_text().split())
+
+
 def extract_internal_number(html):
     """Внутренний номер контракта из HTML печатной формы (после 'Номер контракта')."""
     soup = BeautifulSoup(html, "lxml")
@@ -67,32 +75,32 @@ def extract_internal_number(html):
     return ""
 
 
-def find_printform_url(html):
-    """
-    Находит ссылку на «Печатную форму электронного контракта» в карточке —
-    это действующая редакция «Информация о контракте» (contractInfoPfId).
-    """
+def printform_links(html):
+    """Все ссылки на печатные формы из карточки (абсолютные, без дублей)."""
     soup = BeautifulSoup(html, "lxml")
-    cands = []
+    out, seen = [], set()
     for a in soup.find_all("a", href=lambda h: h and "printForm/view.html" in h):
         href = a.get("href")
         if href.startswith("/"):
             href = BASE + href
-        node = a
-        ctx = ""
-        for _ in range(5):
-            node = node.parent
-            if node is None:
-                break
-            ctx = " ".join(node.get_text().split())
-            if len(ctx) > 15:
-                break
-        low = ctx.lower()
-        if "информация о контракте" in low and "исполнени" not in low:
-            score = 2 if "действ" in low else 1
-            cands.append((score, href))
-    cands.sort(key=lambda x: x[0], reverse=True)
-    return cands[0][1] if cands else None
+        if href not in seen:
+            seen.add(href)
+            out.append(href)
+    return out
+
+
+def is_econtract_printform(html):
+    """True, если это печатная форма электронного контракта (с данными о препарате)."""
+    txt = _plain_text(html)
+    return ECONTRACT_MARKER in txt and "Номер контракта" in txt
+
+
+def printform_version(html):
+    """Версия печатной формы: 'Версия 2 ревизия 1' -> (2, 1). Если нет — (0, 0)."""
+    m = re.search(r"Версия\s*(\d+)\s*ревизия\s*(\d+)", _plain_text(html), re.I)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return (0, 0)
 
 
 def documents_from_html(html):
@@ -215,6 +223,26 @@ class EISClient:
         return "file_" + url.split("uid=")[-1][:8] + ".bin"
 
 
+def choose_econtract_html(client, reestr, card_html, log=print):
+    """
+    Скачивает все печатные формы, выбирает настоящую печатную форму
+    электронного контракта самой свежей версии. Возвращает HTML или None.
+    """
+    best_html, best_ver = None, (-1, -1)
+    for url in printform_links(card_html):
+        try:
+            h = client.get_url(url)
+        except Exception as e:
+            log(f"  печатная форма не открылась: {e}")
+            continue
+        if not is_econtract_printform(h):
+            continue
+        ver = printform_version(h)
+        if ver > best_ver:
+            best_ver, best_html = ver, h
+    return best_html
+
+
 def download_contract(client, number, base_dir, log=print):
     """
     Качает один контракт: печатная форма электронного контракта (HTML, имя = внутр.номер)
@@ -235,12 +263,15 @@ def download_contract(client, number, base_dir, log=print):
         return {"status": "error", "message": f"не скачался((( (карточка: {e})",
                 "internal": number, "reestr": reestr}
 
-    pf_url = find_printform_url(card_html) or (PRINTFORM_URL + "?contractReestrNumber=" + reestr)
-    try:
-        html = client.get_url(pf_url)
-    except Exception as e:
-        return {"status": "error", "message": f"не скачался((( (печатная форма: {e})",
-                "internal": number, "reestr": reestr}
+    html = choose_econtract_html(client, reestr, card_html, log=log)
+    if html is None:
+        # запасной вариант — печатная форма по реестровому номеру
+        try:
+            html = client.get_url(PRINTFORM_URL + "?contractReestrNumber=" + reestr)
+        except Exception as e:
+            return {"status": "error",
+                    "message": f"не скачался((( (печатная форма не найдена: {e})",
+                    "internal": number, "reestr": reestr}
 
     internal = extract_internal_number(html) or number
     folder_name = safe_name(internal)
