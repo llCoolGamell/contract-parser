@@ -58,7 +58,7 @@ class FileItemWidget(QWidget):
         self.label.setToolTip(file_path)
         layout.addWidget(self.label, stretch=1)
 
-        self.status_btn = QPushButton("\u274c")
+        self.status_btn = QPushButton("❌")
         self.status_btn.setFixedSize(28, 28)
         self.status_btn.setCursor(Qt.PointingHandCursor)
         self.status_btn.setStyleSheet(
@@ -72,7 +72,7 @@ class FileItemWidget(QWidget):
 
     def mark_exported(self):
         self._exported = True
-        self.status_btn.setText("\u2705")
+        self.status_btn.setText("✅")
         self.status_btn.setEnabled(False)
         self.status_btn.setStyleSheet(
             "QPushButton { border: none; font-size: 16px; background: transparent; }"
@@ -170,7 +170,7 @@ class FileListWidget(QListWidget):
         self.setItemWidget(item, widget)
         return True
 
-    def add_files(self, file_paths: list[str]) -> int:
+    def add_files(self, file_paths: list) -> int:
         self._had_duplicates = False
         added = 0
         for fp in file_paths:
@@ -188,7 +188,7 @@ class FileListWidget(QListWidget):
                 self.takeItem(i)
                 break
 
-    def mark_exported(self, file_paths: list[str]) -> None:
+    def mark_exported(self, file_paths: list) -> None:
         exported_set = set(file_paths)
         for i in range(self.count()):
             item = self.item(i)
@@ -197,7 +197,7 @@ class FileListWidget(QListWidget):
                 if isinstance(widget, FileItemWidget):
                     widget.mark_exported()
 
-    def get_unexported_paths(self) -> list[str]:
+    def get_unexported_paths(self) -> list:
         paths = []
         for i in range(self.count()):
             item = self.item(i)
@@ -208,7 +208,7 @@ class FileListWidget(QListWidget):
                     paths.append(path)
         return paths
 
-    def get_all_paths(self) -> list[str]:
+    def get_all_paths(self) -> list:
         paths = []
         for i in range(self.count()):
             path = self.item(i).data(Qt.UserRole)
@@ -225,9 +225,9 @@ class ProcessThread(QThread):
 
     def __init__(
         self,
-        file_paths: list[str],
+        file_paths: list,
         excel_path: str,
-        sheet_name: str | None = None,
+        sheet_name=None,
     ):
         super().__init__()
         self.file_paths = file_paths
@@ -247,9 +247,9 @@ class ProcessThread(QThread):
 
     def _do_run(self) -> None:
         parser = ContractParser()
-        contracts: list[ContractData] = []
-        errors: list[str] = []
-        successful_paths: list[str] = []
+        contracts = []
+        errors = []
+        successful_paths = []
         total = len(self.file_paths)
 
         for idx, fp in enumerate(self.file_paths):
@@ -257,27 +257,29 @@ class ProcessThread(QThread):
                 int((idx / total) * 100),
                 f"Обработка: {Path(fp).name}",
             )
+            name = Path(fp).name
             try:
                 results = parser.parse_file(fp)
-                if results:
-                    has_valid = False
-                    for result in results:
-                        if result.errors:
-                            for err in result.errors:
-                                errors.append(f"{Path(fp).name}: {err}")
-                        if result.contract_number:
-                            contracts.append(result)
-                            has_valid = True
-                    if has_valid:
-                        successful_paths.append(fp)
-                    else:
-                        errors.append(
-                            f"{Path(fp).name}: Не удалось извлечь номер контракта"
-                        )
-                else:
-                    errors.append(f"{Path(fp).name}: Неподдерживаемый формат файла")
+                if not results:
+                    errors.append(f"{name}: Неподдерживаемый формат файла")
+                    continue
+
+                file_ok = False
+                for result in results:
+                    for err in result.errors:
+                        errors.append(f"{name}: {err}")
+                    if result.contract_number and not result.is_empty:
+                        contracts.append(result)
+                        file_ok = True
+
+                if file_ok:
+                    successful_paths.append(fp)
+                elif not any(r.errors for r in results):
+                    errors.append(
+                        f"{name}: Не удалось извлечь номер контракта"
+                    )
             except Exception as e:
-                errors.append(f"{Path(fp).name}: {e}")
+                errors.append(f"{name}: {e}")
 
         if not contracts:
             self.finished_signal.emit(
@@ -777,8 +779,8 @@ class MainWindow(QMainWindow):
         self,
         success: bool,
         message: str,
-        errors: list[str],
-        successful_paths: list[str],
+        errors: list,
+        successful_paths: list,
     ) -> None:
         self.progress_bar.setValue(100)
         self.btn_transfer.setEnabled(True)
