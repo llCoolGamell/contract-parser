@@ -2,7 +2,7 @@
 """
 Скачивание контрактов с ЕИС (zakupki.gov.ru) по номеру.
 Ищет в реестре контрактов по любому номеру (реестровый/извещение/ИКЗ/внутренний),
-скачивает HTML печатной формы и PDF контракта (по внутреннему номеру в имени файла).
+скачивает «Печатную форму электронного контракта» (HTML) и PDF контракта.
 
 Тест доступа:      python eis_downloader.py test
 Скачать контракты: python eis_downloader.py "C:\\папка" 01085-ФЛ/2026 2745313582726000543
@@ -47,7 +47,7 @@ def parse_numbers(text):
 
 
 def safe_name(name):
-    """Имя для файла/папки без запрещённых символов Windows."""
+    """Имя для файла/папки без запрещённых символов Windows (/ -> -)."""
     name = re.sub(r'[\\/:*?"<>|]+', "-", name or "")
     return name.strip().strip(".") or "file"
 
@@ -65,6 +65,34 @@ def extract_internal_number(html):
         if t.strip() == "Номер контракта" and i + 1 < len(texts):
             return texts[i + 1].strip()
     return ""
+
+
+def find_printform_url(html):
+    """
+    Находит ссылку на «Печатную форму электронного контракта» в карточке —
+    это действующая редакция «Информация о контракте» (contractInfoPfId).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    cands = []
+    for a in soup.find_all("a", href=lambda h: h and "printForm/view.html" in h):
+        href = a.get("href")
+        if href.startswith("/"):
+            href = BASE + href
+        node = a
+        ctx = ""
+        for _ in range(5):
+            node = node.parent
+            if node is None:
+                break
+            ctx = " ".join(node.get_text().split())
+            if len(ctx) > 15:
+                break
+        low = ctx.lower()
+        if "информация о контракте" in low and "исполнени" not in low:
+            score = 2 if "действ" in low else 1
+            cands.append((score, href))
+    cands.sort(key=lambda x: x[0], reverse=True)
+    return cands[0][1] if cands else None
 
 
 def documents_from_html(html):
@@ -149,16 +177,15 @@ class EISClient:
         nums = re.findall(r"reestrNumber=(\d{15,25})", r.text)
         return nums[0] if nums else None  # первый = самый свежий (сортировка по дате)
 
-    def get_printform_html(self, reestr):
-        r = self.s.get(PRINTFORM_URL, params={"contractReestrNumber": reestr},
-                       timeout=self.timeout)
+    def get_card(self, reestr):
+        r = self.s.get(DOCS_URL, params={"reestrNumber": reestr}, timeout=self.timeout)
         r.raise_for_status()
         return r.text
 
-    def get_documents(self, reestr):
-        r = self.s.get(DOCS_URL, params={"reestrNumber": reestr}, timeout=self.timeout)
+    def get_url(self, url):
+        r = self.s.get(url, timeout=self.timeout)
         r.raise_for_status()
-        return documents_from_html(r.text)
+        return r.text
 
     def download(self, url, dest_dir):
         r = self.s.get(url, timeout=self.timeout, stream=True)
@@ -190,8 +217,9 @@ class EISClient:
 
 def download_contract(client, number, base_dir, log=print):
     """
-    Качает один контракт: печатная форма HTML + PDF с внутренним номером.
-    Возвращает dict: {status: ok|skip|error, message, internal, reestr, folder, files}.
+    Качает один контракт: печатная форма электронного контракта (HTML, имя = внутр.номер)
+    + PDF контракта (по внутреннему номеру в имени).
+    Возвращает dict: {status: ok|skip|error, message, internal, reestr, folder, html, files}.
     """
     try:
         reestr = client.search_reestr(number)
@@ -202,7 +230,14 @@ def download_contract(client, number, base_dir, log=print):
                 "internal": number}
 
     try:
-        html = client.get_printform_html(reestr)
+        card_html = client.get_card(reestr)
+    except Exception as e:
+        return {"status": "error", "message": f"не скачался((( (карточка: {e})",
+                "internal": number, "reestr": reestr}
+
+    pf_url = find_printform_url(card_html) or (PRINTFORM_URL + "?contractReestrNumber=" + reestr)
+    try:
+        html = client.get_url(pf_url)
     except Exception as e:
         return {"status": "error", "message": f"не скачался((( (печатная форма: {e})",
                 "internal": number, "reestr": reestr}
@@ -217,12 +252,13 @@ def download_contract(client, number, base_dir, log=print):
 
     folder = Path(base_dir) / date.today().strftime("%Y-%m-%d") / folder_name
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "Печатная форма.html").write_text(html, encoding="utf-8")
-    saved = ["Печатная форма.html"]
+    html_path = folder / (folder_name + ".html")
+    html_path.write_text(html, encoding="utf-8")
+    saved = [html_path.name]
 
     date_re = re.compile(r"\d{2}\.\d{2}\.\d{4}")
     try:
-        for url, name in client.get_documents(reestr):
+        for url, name in documents_from_html(card_html):
             if not pdf_matches_internal(name, internal):
                 continue
             try:
@@ -231,7 +267,6 @@ def download_contract(client, number, base_dir, log=print):
                 log(f"  файл не скачался: {e}")
                 continue
             # нужен основной PDF контракта: внутр.номер в имени, PDF, без даты
-            # (файлы с датой — доп.соглашения / приёмка, не берём)
             keep = (fn.lower().endswith(".pdf")
                     and pdf_matches_internal(fn, internal)
                     and not date_re.search(fn))
@@ -246,7 +281,8 @@ def download_contract(client, number, base_dir, log=print):
         log(f"  список документов не получен: {e}")
 
     return {"status": "ok", "message": f"скачано файлов: {len(saved)}",
-            "internal": internal, "reestr": reestr, "folder": str(folder), "files": saved}
+            "internal": internal, "reestr": reestr,
+            "folder": str(folder), "html": str(html_path), "files": saved}
 
 
 def _cli():

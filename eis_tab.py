@@ -75,8 +75,8 @@ class DownloadThread(QThread):
                 continue
             if reestr:
                 seen_reestr[reestr] = num
-            if res["status"] == "ok":
-                htmls.append(str(Path(res["folder"]) / "Печатная форма.html"))
+            if res["status"] == "ok" and res.get("html"):
+                htmls.append(res["html"])
             self.item_done.emit(num, res["status"], res["message"])
         self.progress.emit(100, "")
         self.finished_all.emit(htmls)
