@@ -46,7 +46,7 @@ class FileItemWidget(QWidget):
 
     remove_clicked = pyqtSignal(str)
 
-    def __init__(self, filename: str, file_path: str, parent=None):
+    def __init__(self, filename: str, file_path: str, parent=None, source: str = ""):
         super().__init__(parent)
         self.file_path = file_path
         self._exported = False
@@ -58,6 +58,11 @@ class FileItemWidget(QWidget):
         self.label = QLabel(filename)
         self.label.setToolTip(file_path)
         layout.addWidget(self.label, stretch=1)
+
+        if source:
+            tag = QLabel(source)
+            tag.setStyleSheet("color:#2e7d32; font-size:10px; font-style:italic;")
+            layout.addWidget(tag)
 
         self.status_btn = QPushButton("❌")
         self.status_btn.setFixedSize(28, 28)
@@ -141,18 +146,18 @@ class FileListWidget(QListWidget):
         else:
             super().dropEvent(event)
 
-    def _add_file_if_valid(self, file_path: str) -> bool:
+    def _add_file_if_valid(self, file_path: str, source: str = "") -> bool:
         path = Path(file_path)
         if path.is_dir():
             added = False
             for f in path.iterdir():
                 if f.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    if self._add_single_file(str(f)):
+                    if self._add_single_file(str(f), source):
                         added = True
             return added
-        return self._add_single_file(file_path)
+        return self._add_single_file(file_path, source)
 
-    def _add_single_file(self, file_path: str) -> bool:
+    def _add_single_file(self, file_path: str, source: str = "") -> bool:
         path = Path(file_path)
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             return False
@@ -166,16 +171,16 @@ class FileListWidget(QListWidget):
         item.setSizeHint(QSize(0, 32))
         self.addItem(item)
 
-        widget = FileItemWidget(path.name, file_path)
+        widget = FileItemWidget(path.name, file_path, source=source)
         widget.remove_clicked.connect(self._remove_file)
         self.setItemWidget(item, widget)
         return True
 
-    def add_files(self, file_paths: list) -> int:
+    def add_files(self, file_paths: list, source: str = "") -> int:
         self._had_duplicates = False
         added = 0
         for fp in file_paths:
-            if self._add_file_if_valid(fp):
+            if self._add_file_if_valid(fp, source):
                 added += 1
         return added
 
@@ -630,14 +635,15 @@ class MainWindow(QMainWindow):
         self.process_thread = None
 
         # --- Вкладки: парсер контрактов + скачивание из ЕИС ---
-        tabs = QTabWidget()
-        tabs.addTab(central, "Парсер контрактов")
+        self.tabs = QTabWidget()
+        self.tabs.addTab(central, "Парсер контрактов")
         try:
             from eis_tab import EisTab
-            tabs.addTab(EisTab(), "Скачать из ЕИС")
+            self.tabs.addTab(EisTab(on_load_to_parser=self.load_from_eis),
+                             "Скачать из ЕИС")
         except Exception as e:
             print("EIS-вкладка недоступна:", e)
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(self.tabs)
 
     def _toggle_excel_mode(self) -> None:
         is_existing = self.radio_existing.isChecked()
@@ -670,6 +676,14 @@ class MainWindow(QMainWindow):
 
     def clear_files(self) -> None:
         self.file_list.clear()
+
+    def load_from_eis(self, paths) -> int:
+        """Добавляет скачанные из ЕИС печатные формы в список парсера и переключает вкладку."""
+        added = self.file_list.add_files(list(paths), source="загружен из ЕИС")
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(0)
+        self.log(f"Из ЕИС добавлено в парсер: {added}")
+        return added
 
     def browse_excel(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

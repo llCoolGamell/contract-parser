@@ -83,9 +83,11 @@ class DownloadThread(QThread):
 
 
 class EisTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, on_load_to_parser=None):
         super().__init__(parent)
-        self.statuses = {}   # number -> status
+        self.statuses = {}        # number -> status
+        self.last_htmls = []      # пути скачанных печатных форм
+        self.on_load_to_parser = on_load_to_parser
         self.test_thread = None
         self.dl_thread = None
         self._build_ui()
@@ -162,6 +164,19 @@ class EisTab(QWidget):
         rv = QVBoxLayout(right)
         self.result_list = QListWidget()
         rv.addWidget(self.result_list)
+
+        res_btns = QHBoxLayout()
+        self.btn_clear_res = QPushButton("Очистить")
+        self.btn_clear_res.clicked.connect(self.clear_results)
+        res_btns.addWidget(self.btn_clear_res)
+        self.btn_to_parser = QPushButton("Загрузить в парсер")
+        self.btn_to_parser.setStyleSheet(
+            "QPushButton{background:#4CAF50;color:white;border:none;border-radius:6px;"
+            "padding:8px;font-weight:bold;} QPushButton:hover{background:#45a049;}")
+        self.btn_to_parser.clicked.connect(self.load_to_parser)
+        res_btns.addWidget(self.btn_to_parser)
+        rv.addLayout(res_btns)
+
         rv.addWidget(QLabel("Лог:"))
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
@@ -223,10 +238,12 @@ class EisTab(QWidget):
             if not numbers:
                 QMessageBox.warning(self, "Нет номеров", "Вставьте номера контрактов.")
                 return
-            seen = set(); uniq = []
+            seen = set()
+            uniq = []
             for n in numbers:
                 if n not in seen:
-                    seen.add(n); uniq.append(n)
+                    seen.add(n)
+                    uniq.append(n)
             numbers = uniq
             self.result_list.clear()
             self.statuses = {}
@@ -261,7 +278,25 @@ class EisTab(QWidget):
             self.result_list.addItem(it)
         self.log(text)
 
+    def clear_results(self):
+        self.result_list.clear()
+        self.statuses = {}
+        self.last_htmls = []
+        self.log_area.clear()
+
+    def load_to_parser(self):
+        if not self.last_htmls:
+            QMessageBox.information(self, "Нет данных",
+                                   "Сначала скачайте контракты — потом загрузим печатные формы в парсер.")
+            return
+        if not self.on_load_to_parser:
+            QMessageBox.warning(self, "Недоступно", "Связка с парсером недоступна.")
+            return
+        n = self.on_load_to_parser(self.last_htmls)
+        self.log(f"Загружено в парсер печатных форм: {n}")
+
     def _on_finished(self, htmls):
+        self.last_htmls = list(htmls)
         self.progress.setValue(100)
         self.btn_download.setEnabled(True)
         self.btn_retry.setEnabled(True)
@@ -269,8 +304,8 @@ class EisTab(QWidget):
         err = sum(1 for s in self.statuses.values() if s == "error")
         self.log(f"Готово. Успешно: {ok}, не скачалось: {err}")
 
-        if self.chk_parse.isChecked() and htmls:
-            self._parse_to_excel(htmls)
+        if self.chk_parse.isChecked() and self.last_htmls:
+            self._parse_to_excel(self.last_htmls)
         else:
             QMessageBox.information(self, "Готово",
                                    f"Скачано: {ok}. Не скачалось: {err}.")

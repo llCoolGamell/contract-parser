@@ -173,12 +173,18 @@ class EISClient:
 
     def _filename(self, r, url):
         cd = r.headers.get("Content-Disposition", "")
-        m = re.search(r"filename\*=UTF-8''([^;]+)", cd)
+        m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I)
         if m:
             return safe_name(requests.utils.unquote(m.group(1)))
         m = re.search(r'filename="?([^";]+)"?', cd)
         if m:
-            return safe_name(m.group(1))
+            fn = m.group(1)
+            # HTTP-заголовки приходят как latin-1; восстанавливаем кириллицу из UTF-8
+            try:
+                fn = fn.encode("latin-1").decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+            return safe_name(fn)
         return "file_" + url.split("uid=")[-1][:8] + ".bin"
 
 
@@ -214,18 +220,28 @@ def download_contract(client, number, base_dir, log=print):
     (folder / "Печатная форма.html").write_text(html, encoding="utf-8")
     saved = ["Печатная форма.html"]
 
+    date_re = re.compile(r"\d{2}\.\d{2}\.\d{4}")
     try:
         for url, name in client.get_documents(reestr):
             if not pdf_matches_internal(name, internal):
                 continue
             try:
                 fn = client.download(url, folder)
-                if fn.lower().endswith(".pdf"):
-                    saved.append(fn)
-                else:
-                    (folder / fn).unlink(missing_ok=True)  # не PDF — не нужен
             except Exception as e:
                 log(f"  файл не скачался: {e}")
+                continue
+            # нужен основной PDF контракта: внутр.номер в имени, PDF, без даты
+            # (файлы с датой — доп.соглашения / приёмка, не берём)
+            keep = (fn.lower().endswith(".pdf")
+                    and pdf_matches_internal(fn, internal)
+                    and not date_re.search(fn))
+            if keep:
+                saved.append(fn)
+            else:
+                try:
+                    (folder / fn).unlink()
+                except OSError:
+                    pass
     except Exception as e:
         log(f"  список документов не получен: {e}")
 
