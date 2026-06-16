@@ -29,6 +29,7 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QAbstractItemView,
     QSizePolicy,
+    QTabWidget,
 )
 from PyQt5.QtCore import Qt, QMimeData, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon, QDragEnterEvent, QDropEvent, QPalette, QColor
@@ -312,7 +313,6 @@ class MainWindow(QMainWindow):
         self.setPalette(palette)
 
         central = QWidget()
-        self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(12)
@@ -628,6 +628,16 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(right_group, stretch=2)
 
         self.process_thread = None
+
+        # --- Вкладки: парсер контрактов + скачивание из ЕИС ---
+        tabs = QTabWidget()
+        tabs.addTab(central, "Парсер контрактов")
+        try:
+            from eis_tab import EisTab
+            tabs.addTab(EisTab(), "Скачать из ЕИС")
+        except Exception as e:
+            print("EIS-вкладка недоступна:", e)
+        self.setCentralWidget(tabs)
 
     def _toggle_excel_mode(self) -> None:
         is_existing = self.radio_existing.isChecked()
