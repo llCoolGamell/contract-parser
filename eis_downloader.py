@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Скачивание контрактов с ЕИС (zakupki.gov.ru) по номеру.
-Ищет в реестре контрактов по любому номеру (реестровый/извещение/ИКЗ/внутренний),
-скачивает «Печатную форму электронного контракта» (HTML, самая свежая версия) и PDF контракта.
+Ищет контракт в реестре по любому номеру (реестровый/извещение/ИКЗ/внутренний),
+из списка документов карточки берёт «Печатную форму электронного контракта» (HTML)
+и PDF контракта (по внутреннему номеру в имени).
 
 Тест доступа:      python eis_downloader.py test
 Скачать контракты: python eis_downloader.py "C:\\папка" 01085-ФЛ/2026 2745313582726000543
@@ -21,9 +22,7 @@ from bs4 import BeautifulSoup
 BASE = "https://zakupki.gov.ru"
 SEARCH_URL = BASE + "/epz/contract/search/results.html"
 DOCS_URL = BASE + "/epz/contract/contractCard/document-info.html"
-PRINTFORM_URL = BASE + "/epz/contract/printForm/view.html"
 
-# Маркер настоящей печатной формы электронного контракта (её ест парсер)
 ECONTRACT_MARKER = "Электронный контракт, сформированный с использованием ЕИС"
 
 HEADERS = {
@@ -75,20 +74,6 @@ def extract_internal_number(html):
     return ""
 
 
-def printform_links(html):
-    """Все ссылки на печатные формы из карточки (абсолютные, без дублей)."""
-    soup = BeautifulSoup(html, "lxml")
-    out, seen = [], set()
-    for a in soup.find_all("a", href=lambda h: h and "printForm/view.html" in h):
-        href = a.get("href")
-        if href.startswith("/"):
-            href = BASE + href
-        if href not in seen:
-            seen.add(href)
-            out.append(href)
-    return out
-
-
 def is_econtract_printform(html):
     """True, если это печатная форма электронного контракта (с данными о препарате)."""
     txt = _plain_text(html)
@@ -103,8 +88,36 @@ def printform_version(html):
     return (0, 0)
 
 
+def _doc_name(a):
+    """Полное имя файла рядом со ссылкой (из атрибута title), без размера '(71 Кб)'."""
+    name = a.get("title") or ""
+    if not name:
+        node = a
+        for _ in range(4):
+            node = node.parent
+            if node is None:
+                break
+            el = node.find(attrs={"title": True})
+            if el and el.get("title"):
+                name = el.get("title")
+                break
+    if not name:
+        node = a
+        for _ in range(4):
+            node = node.parent
+            if node is None:
+                break
+            txt = " ".join(node.get_text().split())
+            if txt:
+                name = re.split(r"\s*№\s*\d{6,}", txt)[0].strip()
+                if name:
+                    break
+    name = re.sub(r"\s*\([\d.,]+\s*[A-Za-zА-Яа-я]+\)\s*$", "", name).strip()
+    return name
+
+
 def documents_from_html(html):
-    """Список (url, имя) всех файлов-вложений со страницы документов карточки."""
+    """Список (url, имя файла) всех вложений карточки (имя — полное, из title)."""
     soup = BeautifulSoup(html, "lxml")
     out, seen = [], set()
     for a in soup.find_all("a", href=lambda h: h and "filestore/public" in h):
@@ -115,18 +128,7 @@ def documents_from_html(html):
         if uid in seen:
             continue
         seen.add(uid)
-        name = ""
-        node = a
-        for _ in range(5):
-            node = node.parent
-            if node is None:
-                break
-            txt = " ".join(node.get_text().split())
-            if txt:
-                name = re.split(r"\s*№\s*\d{6,}", txt)[0].strip()
-                if name:
-                    break
-        out.append((href, name))
+        out.append((href, _doc_name(a)))
     return out
 
 
@@ -190,7 +192,7 @@ class EISClient:
         r.raise_for_status()
         return r.text
 
-    def get_url(self, url):
+    def get_text(self, url):
         r = self.s.get(url, timeout=self.timeout)
         r.raise_for_status()
         return r.text
@@ -214,7 +216,6 @@ class EISClient:
         m = re.search(r'filename="?([^";]+)"?', cd)
         if m:
             fn = m.group(1)
-            # HTTP-заголовки приходят как latin-1; восстанавливаем кириллицу из UTF-8
             try:
                 fn = fn.encode("latin-1").decode("utf-8")
             except (UnicodeEncodeError, UnicodeDecodeError):
@@ -223,24 +224,29 @@ class EISClient:
         return "file_" + url.split("uid=")[-1][:8] + ".bin"
 
 
-def choose_econtract_html(client, reestr, card_html, log=print):
+def choose_printform_html(client, docs, log=print):
     """
-    Скачивает все печатные формы, выбирает настоящую печатную форму
-    электронного контракта самой свежей версии. Возвращает HTML или None.
+    Среди документов карточки находит HTML «Печатной формы электронного контракта»
+    самой свежей версии. Возвращает (html_text) или None.
     """
-    best_html, best_ver = None, (-1, -1)
-    for url in printform_links(card_html):
+    # 1) приоритет — HTML с «печатной формой» в имени
+    ordered = [d for d in docs if d[1].lower().endswith(".html") and "печатн" in d[1].lower()]
+    # 2) затем — любой HTML (вдруг назван иначе)
+    ordered += [d for d in docs if d[1].lower().endswith(".html") and d not in ordered]
+
+    best, best_ver = None, (-1, -1)
+    for url, name in ordered:
         try:
-            h = client.get_url(url)
+            h = client.get_text(url)
         except Exception as e:
-            log(f"  печатная форма не открылась: {e}")
+            log(f"  не открылся {name}: {e}")
             continue
         if not is_econtract_printform(h):
             continue
         ver = printform_version(h)
         if ver > best_ver:
-            best_ver, best_html = ver, h
-    return best_html
+            best_ver, best = ver, h
+    return best
 
 
 def download_contract(client, number, base_dir, log=print):
@@ -263,15 +269,12 @@ def download_contract(client, number, base_dir, log=print):
         return {"status": "error", "message": f"не скачался((( (карточка: {e})",
                 "internal": number, "reestr": reestr}
 
-    html = choose_econtract_html(client, reestr, card_html, log=log)
+    docs = documents_from_html(card_html)
+    html = choose_printform_html(client, docs, log=log)
     if html is None:
-        # запасной вариант — печатная форма по реестровому номеру
-        try:
-            html = client.get_url(PRINTFORM_URL + "?contractReestrNumber=" + reestr)
-        except Exception as e:
-            return {"status": "error",
-                    "message": f"не скачался((( (печатная форма не найдена: {e})",
-                    "internal": number, "reestr": reestr}
+        return {"status": "error",
+                "message": "не скачался((( (печатная форма электронного контракта не найдена)",
+                "internal": number, "reestr": reestr}
 
     internal = extract_internal_number(html) or number
     folder_name = safe_name(internal)
@@ -288,28 +291,15 @@ def download_contract(client, number, base_dir, log=print):
     saved = [html_path.name]
 
     date_re = re.compile(r"\d{2}\.\d{2}\.\d{4}")
-    try:
-        for url, name in documents_from_html(card_html):
-            if not pdf_matches_internal(name, internal):
-                continue
+    for url, name in docs:
+        low = name.lower()
+        # нужный PDF: внутр.номер в имени, .pdf, без даты (доп.соглашения/приёмку не берём)
+        if low.endswith(".pdf") and pdf_matches_internal(name, internal) and not date_re.search(name):
             try:
                 fn = client.download(url, folder)
+                saved.append(fn)
             except Exception as e:
                 log(f"  файл не скачался: {e}")
-                continue
-            # нужен основной PDF контракта: внутр.номер в имени, PDF, без даты
-            keep = (fn.lower().endswith(".pdf")
-                    and pdf_matches_internal(fn, internal)
-                    and not date_re.search(fn))
-            if keep:
-                saved.append(fn)
-            else:
-                try:
-                    (folder / fn).unlink()
-                except OSError:
-                    pass
-    except Exception as e:
-        log(f"  список документов не получен: {e}")
 
     return {"status": "ok", "message": f"скачано файлов: {len(saved)}",
             "internal": internal, "reestr": reestr,
