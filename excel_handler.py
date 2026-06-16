@@ -29,12 +29,17 @@ HEADERS = [
     "Общая цена, руб.",
     "поставщик",
     "способ размещения",
-    "Сумма",
 ]
 
-COLUMN_WIDTHS = [15, 18, 15, 30, 25, 30, 25, 50, 10, 15, 45, 20, 20, 25, 25, 20]
+COLUMN_WIDTHS = [15, 18, 15, 30, 25, 30, 25, 50, 10, 15, 45, 20, 20, 25, 25]
 
 SHEET_NAME = "Контракты"
+
+# Индексы столбцов (1-based)
+COL_DOSAGE = 8       # Лек. Форма
+COL_QTY = 10         # Общее кол-во
+COL_UNIT_PRICE = 12  # Цена ед. продукции
+COL_TOTAL = 13       # Общая цена
 
 
 def _owner_abbreviation(full_name: str) -> str:
@@ -50,10 +55,19 @@ def _owner_abbreviation(full_name: str) -> str:
     return full_name
 
 
+# Красный — расхождение количества из источников
 RED_FILL = PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
-BLUE_FILL = PatternFill(start_color="6699FF", end_color="6699FF", fill_type="solid")
+# Жёлтый — Лек.форма требует проверки (только МНН / нестандартная упаковка)
 YELLOW_FILL = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+# Оранжевый — Лек.форма пустая (незарегистрированный препарат)
 ORANGE_FILL = PatternFill(start_color="FFB347", end_color="FFB347", fill_type="solid")
+
+
+def _qty_value(packages: float):
+    """Целое, если значение целое, иначе дробное."""
+    if packages == int(packages):
+        return int(packages)
+    return packages
 
 
 def contract_to_row(data: ContractData) -> list:
@@ -63,30 +77,26 @@ def contract_to_row(data: ContractData) -> list:
 
     owner = _owner_abbreviation(data.customer_short_name)
 
-    qty_value = data.quantity_all_values if data.quantity_mismatch else data.quantity_packages
-
     return [
         owner,
         "Основная заявка",
-        "",
+        "",                       # код ЛС льготный — заполняется вручную
         contract_str,
-        data.notice_number,
+        "",                       # № аукциона — не заполняется
         data.mnn,
         data.trade_name,
         data.dosage_form,
         data.unit,
-        qty_value,
+        _qty_value(data.quantity_packages),
         data.manufacturer,
         data.unit_price,
         data.total_price,
         data.supplier_short_name,
         data.procurement_method,
-        data.total_price,
     ]
 
 
 def _apply_header_style(ws, row_num: int) -> None:
-    header_font = Font(bold=True, size=10)
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     header_font_white = Font(bold=True, size=10, color="FFFFFF")
     thin_border = Border(
@@ -118,7 +128,7 @@ def _apply_data_style(ws, row_num: int) -> None:
         cell = ws.cell(row=row_num, column=col_idx)
         cell.border = thin_border
         cell.alignment = wrap_align
-        if col_idx in (10, 12, 13, 16):
+        if col_idx in (COL_UNIT_PRICE, COL_TOTAL):
             cell.number_format = "#,##0.00"
 
 
@@ -145,9 +155,9 @@ def create_new_excel(file_path: str) -> str:
 
 def write_contracts_to_excel(
     file_path: str,
-    contracts: list[ContractData],
+    contracts: list,
     sheet_name: Optional[str] = None,
-) -> tuple[bool, str]:
+) -> tuple:
     path = Path(file_path)
     target_sheet = sheet_name or SHEET_NAME
 
@@ -180,77 +190,43 @@ def write_contracts_to_excel(
             if first_cell is None:
                 last_row = 0
 
-        # Write contracts
         written = 0
-        qty_mismatch_rows = []
-        dosage_mnn_only_rows = []
-        dosage_empty_rows = []
         for contract in contracts:
             row_data = contract_to_row(contract)
             row_num = last_row + 1 + written
             for col_idx, value in enumerate(row_data, 1):
                 ws.cell(row=row_num, column=col_idx, value=value)
             _apply_data_style(ws, row_num)
+
+            # Красный — расхождение количества
             if contract.quantity_mismatch:
-                qty_mismatch_rows.append(row_num)
-            if contract.dosage_form_mnn_only:
-                dosage_mnn_only_rows.append(row_num)
+                ws.cell(row=row_num, column=COL_QTY).fill = RED_FILL
+
+            # Оранжевый — пустая форма; жёлтый — только МНН / нестандартная упаковка
             if contract.dosage_form_empty:
-                dosage_empty_rows.append(row_num)
+                ws.cell(row=row_num, column=COL_DOSAGE).fill = ORANGE_FILL
+            elif contract.dosage_form_mnn_only or contract.dosage_form_uncertain:
+                ws.cell(row=row_num, column=COL_DOSAGE).fill = YELLOW_FILL
+
             written += 1
-
-        # Check for duplicate rows in the entire sheet
-        all_rows = {}
-        duplicate_rows = set()
-        for row_num in range(2, ws.max_row + 1):
-            row_values = tuple(
-                ws.cell(row=row_num, column=col).value
-                for col in range(1, len(HEADERS) + 1)
-            )
-            if row_values in all_rows:
-                duplicate_rows.add(row_num)
-                duplicate_rows.add(all_rows[row_values])
-            else:
-                all_rows[row_values] = row_num
-
-        has_duplicates = len(duplicate_rows) > 0
-        if has_duplicates:
-            for row_num in duplicate_rows:
-                for col_idx in range(1, len(HEADERS) + 1):
-                    ws.cell(row=row_num, column=col_idx).fill = BLUE_FILL
-
-        # Apply red fill for quantity mismatches (on top of blue if needed)
-        for row_num in qty_mismatch_rows:
-            ws.cell(row=row_num, column=10).fill = RED_FILL
-
-        # Apply yellow fill for dosage_form with MNN only
-        for row_num in dosage_mnn_only_rows:
-            ws.cell(row=row_num, column=8).fill = YELLOW_FILL
-
-        # Apply orange fill for empty dosage_form (ПУСТО — незарегистрированный препарат)
-        for row_num in dosage_empty_rows:
-            ws.cell(row=row_num, column=8).fill = ORANGE_FILL
 
         save_path = str(path)
         if not save_path.endswith(".xlsx"):
             save_path = save_path.rsplit(".", 1)[0] + ".xlsx"
 
         wb.save(save_path)
-        msg = f"Записано {written} контракт(ов) в {save_path}"
-        if has_duplicates:
-            msg += "\n\nПри выгрузке обнаружены дубли (выделены синим цветом)"
+        msg = f"Записано {written} строк(и) в {save_path}"
         return True, msg
 
     except PermissionError:
         return False, (
-            "Файл занят другой программой. "
-            "Закройте Excel и повторите попытку."
+            "Файл занят другой программой. Закройте Excel и повторите попытку."
         )
     except Exception as e:
         return False, f"Ошибка записи: {e}"
 
 
-def get_sheet_names(file_path: str) -> list[str]:
+def get_sheet_names(file_path: str) -> list:
     try:
         path = Path(file_path)
         if path.suffix == ".xlsx":
