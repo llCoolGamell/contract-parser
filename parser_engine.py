@@ -1,6 +1,7 @@
 """
 Парсер электронных контрактов с сайта zakupki.gov.ru (ЕИС).
 Извлекает данные из HTML-файлов печатных форм контрактов.
+Поддерживает контракты с несколькими позициями лекарственных препаратов.
 """
 
 import re
@@ -22,6 +23,9 @@ class ContractData:
     mnn: str = ""
     trade_name: str = ""
     dosage_form: str = ""
+    dosage_form_mnn_only: bool = False
+    dosage_form_empty: bool = False
+    dosage_form_uncertain: bool = False  # нестандартная упаковка -> пометить жёлтым
     unit: str = "упак."
     quantity_packages: float = 0.0
     quantity_mismatch: bool = False
@@ -32,42 +36,469 @@ class ContractData:
     source_file: str = ""
     errors: list = field(default_factory=list)
 
+    @property
+    def is_empty(self) -> bool:
+        """Контракт без полезных данных (нет препарата) — выводить не нужно."""
+        return (
+            not self.mnn
+            and not self.trade_name
+            and self.quantity_packages == 0
+            and self.total_price == 0
+        )
+
 
 class ContractParser:
     """Парсер HTML-файлов контрактов с zakupki.gov.ru."""
 
-    def parse_file(self, file_path: str) -> Optional[ContractData]:
+    def parse_file(self, file_path: str) -> list[ContractData]:
         path = Path(file_path)
         if not path.exists():
-            return None
+            return []
 
         suffix = path.suffix.lower()
         if suffix in (".html", ".htm"):
             return self._parse_html(path)
         elif suffix == ".pdf":
             return self._parse_pdf(path)
-        return None
+        return []
 
-    def _parse_html(self, path: Path) -> ContractData:
+    def _parse_html(self, path: Path) -> list[ContractData]:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
 
         soup = BeautifulSoup(content, "lxml")
         texts = self._extract_texts(soup)
-        data = ContractData(source_file=str(path))
 
-        self._extract_contract_number(texts, data)
-        self._extract_notice_number(texts, data)
-        self._extract_procurement_method(texts, data)
-        self._extract_customer_info(texts, data)
-        self._extract_supplier_info(texts, data)
-        self._extract_object_info(texts, data)
-        self._extract_drug_details(texts, data)
-        self._extract_contract_date(texts, data)
+        base = ContractData(source_file=str(path))
+        self._extract_contract_number(texts, base)
+        self._extract_notice_number(texts, base)
+        self._extract_procurement_method(texts, base)
+        self._extract_customer_info(texts, base)
+        self._extract_supplier_info(texts, base)
+        self._extract_contract_date(texts, base)
 
-        return data
+        object_rows = self._parse_object_table(texts)
+        drug_entries = self._parse_drug_entries(texts)
 
-    def _extract_texts(self, soup: BeautifulSoup) -> list[str]:
+        if drug_entries:
+            return self._build_contracts(base, object_rows, drug_entries)
+
+        # Нет раздела о препарате — данных нет, пишем ошибку в лог
+        base.errors.append(
+            "Нет данных о лекарственном препарате (раздел не найден) — строка пропущена"
+        )
+        base.dosage_form_empty = True
+        return [base]
+
+    # ------------------------------------------------------------------
+    # Числовые помощники
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_num(s: str) -> float:
+        """Парсит число (целое или дробное) из текста: '0.4' -> 0.4, '1,91' -> 1.91, '8' -> 8."""
+        if not s:
+            return 0.0
+        normalized = s.replace(" ", " ").strip()
+        match = re.match(r"^\s*(\d[\d\s]*(?:[.,]\d+)?)", normalized)
+        if not match:
+            return 0.0
+        num_str = match.group(1).replace(" ", "").replace(",", ".")
+        try:
+            return float(num_str)
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _format_num(v: float) -> str:
+        """Число для текста Лек.формы: 120 -> '120', 0.4 -> '0,4', 2.5 -> '2,5'."""
+        if v == int(v):
+            return str(int(v))
+        s = ("%f" % v).rstrip("0").rstrip(".")
+        return s.replace(".", ",")
+
+    def _pack_word(self, pack_type: str, count: float) -> str:
+        """
+        Слово упаковки для Лек.формы.
+        Добавляется ТОЛЬКО для шприцев, шприц-ручек и ингаляторов.
+        Для флаконов, баллонов, ампул и т.п. — пусто (пометится жёлтым на проверку).
+        """
+        pt = (pack_type or "").strip().upper()
+        n = count if count and count > 0 else 1
+        if "ШПРИЦ-РУЧК" in pt:
+            return "шприц-ручка" if n <= 1 else "шприц-ручки"
+        if "ШПРИЦ" in pt:
+            return "шприц" if n <= 1 else "шприцы"
+        if "ИНГАЛЯТОР" in pt:
+            return "ИНГАЛЯТОР"  # как в эталоне: верхний регистр, единственное число
+        return ""
+
+    def _build_dosage_form(
+        self,
+        grls_form: str,
+        mnn_object: str,
+        qty_in_primary: float,
+        qty_primary_per_consumer: float,
+        pack_type: str,
+    ) -> tuple[str, bool, bool, bool]:
+        """
+        Возвращает (текст, mnn_only, empty, uncertain).
+        Формат: <форма из ГРЛС> + <число> + <ед-ца мл/доз> + [слово упаковки] + №<кол-во перв. упак.>
+        Единица: 'мл' для растворов/капель, 'доз' для аэрозолей/ингаляций,
+                 для лиофилизата (МЕ и т.п.) число/единица не добавляются, только №N.
+        """
+        # База: форма из ГРЛС (часть после двоеточия)
+        if grls_form:
+            parts = grls_form.split(":", 1)
+            if len(parts) == 2 and parts[1].strip():
+                form_text = parts[1].strip()
+            else:
+                # после двоеточия пусто — есть только МНН
+                return grls_form.strip(), True, False, True
+        elif mnn_object:
+            return mnn_object, True, False, True
+        else:
+            return "ПУСТО", False, True, False
+
+        low = form_text.lower()
+        if "мл" in low:
+            unit = "мл"
+        elif "доз" in low:
+            unit = "доз"
+        else:
+            unit = ""
+
+        word = self._pack_word(pack_type, qty_primary_per_consumer)
+        n_str = self._format_num(
+            qty_primary_per_consumer if qty_primary_per_consumer > 0 else 1
+        )
+
+        if unit and qty_in_primary > 0:
+            suffix = f"{self._format_num(qty_in_primary)} {unit}"
+            if word:
+                suffix += f" {word}"
+            suffix += f" №{n_str}"
+        else:
+            # лиофилизат / нераспознанная единица — только №N (+ слово, если есть)
+            suffix = f"{word} №{n_str}".strip() if word else f"№{n_str}"
+
+        text = f"{form_text} {suffix}"
+        # жёлтый, если слово упаковки не добавлено (флакон/баллон/прочее) — на ручную проверку
+        uncertain = not bool(word)
+        return text, False, False, uncertain
+
+    # ------------------------------------------------------------------
+    # Multi-row: object table parsing
+    # ------------------------------------------------------------------
+
+    def _parse_object_table(self, texts: list[str]) -> dict:
+        """Parse the object table (3.1) into {row_num: row_data}."""
+        result = {}
+
+        header_pos = None
+        for i, t in enumerate(texts):
+            if "Наименование объекта закупки" in t:
+                header_pos = i
+                break
+
+        if header_pos is None:
+            return result
+
+        data_start = None
+        for j in range(header_pos + 9, min(header_pos + 40, len(texts))):
+            if (
+                texts[j] == "9"
+                and j >= 8
+                and texts[j - 1] == "8"
+                and texts[j - 2] == "7"
+                and texts[j - 3] == "6"
+                and texts[j - 4] == "5"
+                and texts[j - 5] == "4"
+                and texts[j - 6] == "3"
+                and texts[j - 7] == "2"
+                and texts[j - 8] == "1"
+            ):
+                data_start = j + 1
+                break
+
+        if data_start is None:
+            return result
+
+        idx = data_start
+        while idx + 8 < len(texts):
+            if texts[idx] == "Итого:" or "Дополнительная информация" in texts[idx]:
+                break
+
+            try:
+                row_num = int(texts[idx])
+            except ValueError:
+                break
+
+            name = texts[idx + 1]
+            qty_and_unit = texts[idx + 4]
+            unit_price_str = texts[idx + 5]
+            total_sum_str = texts[idx + 8]
+
+            result[row_num] = {
+                "name": name,
+                "qty": self._parse_num(qty_and_unit),
+                "unit_price": self._parse_num(unit_price_str),
+                "sum": self._parse_num(total_sum_str),
+            }
+            idx += 9
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Multi-row: drug detail entries parsing
+    # ------------------------------------------------------------------
+
+    def _parse_drug_entries(self, texts: list[str]) -> list:
+        """Parse all drug detail entries from 'Дополнительная информация о лекарственном препарате'."""
+        entries = []
+
+        section_start = None
+        for i, t in enumerate(texts):
+            if "Дополнительная информация о лекарственном препарате" in t:
+                section_start = i
+                break
+
+        if section_start is None:
+            return entries
+
+        data_start = None
+        for j in range(section_start + 6, min(section_start + 30, len(texts))):
+            if (
+                texts[j] == "6"
+                and j >= 5
+                and texts[j - 1] == "5"
+                and texts[j - 2] == "4"
+                and texts[j - 3] == "3"
+                and texts[j - 4] == "2"
+                and texts[j - 5] == "1"
+            ):
+                data_start = j + 1
+                break
+
+        if data_start is None:
+            return entries
+
+        section_end = len(texts)
+        for i in range(data_start, len(texts)):
+            t = texts[i]
+            if "4. Условия контракта" in t:
+                section_end = i
+                break
+            if "Дополнительная информация об адресе" in t:
+                section_end = i
+                break
+
+        idx = data_start
+        while idx + 5 < section_end:
+            try:
+                row_num = int(texts[idx])
+            except ValueError:
+                idx += 1
+                continue
+
+            try:
+                obj_num = int(texts[idx + 1])
+            except ValueError:
+                idx += 1
+                continue
+
+            entry = {
+                "row_num": row_num,
+                "obj_num": obj_num,
+                "trade_name_raw": texts[idx + 2],
+                "dosage_form_raw": texts[idx + 3],
+                "primary_pack_type": texts[idx + 4],
+                "qty_consumer": 0.0,
+                "grls_form": "",
+                "holder": "",
+                "producer": "",
+                "qty_in_primary": 0.0,
+                "qty_primary_per_consumer": 0.0,
+                "qty_per_consumer": 0.0,
+                "total_qty": 0.0,
+                "completeness": "",
+            }
+
+            entry["qty_consumer"] = self._parse_num(texts[idx + 5])
+
+            idx += 6
+
+            while idx < section_end:
+                t = texts[idx]
+
+                if t == "МНН и форма выпуска в соответствии с ГРЛС" and idx + 1 < section_end:
+                    next_val = texts[idx + 1]
+                    if next_val in (
+                        "Наименование держателя или владельца РУ",
+                        "Производитель",
+                        "Количество лекарственных форм в первичной упаковке",
+                        "Признак включения в ЖНВЛП",
+                    ):
+                        entry["grls_form"] = ""
+                        idx += 1
+                    else:
+                        entry["grls_form"] = next_val
+                        idx += 2
+                elif t == "Наименование держателя или владельца РУ" and idx + 1 < section_end:
+                    entry["holder"] = texts[idx + 1]
+                    idx += 2
+                elif t == "Производитель" and idx + 1 < section_end:
+                    entry["producer"] = texts[idx + 1]
+                    idx += 2
+                elif t == "Количество лекарственных форм в первичной упаковке" and idx + 1 < section_end:
+                    entry["qty_in_primary"] = self._parse_num(texts[idx + 1])
+                    idx += 2
+                elif t == "Количество первичных упаковок в потребительской упаковке" and idx + 1 < section_end:
+                    entry["qty_primary_per_consumer"] = self._parse_num(texts[idx + 1])
+                    idx += 2
+                elif t == "Количество потребительских единиц в потребительской упаковке" and idx + 1 < section_end:
+                    entry["qty_per_consumer"] = self._parse_num(texts[idx + 1])
+                    idx += 2
+                elif t == "Общее количество" and idx + 1 < section_end:
+                    entry["total_qty"] = self._parse_num(texts[idx + 1])
+                    idx += 2
+                elif t == "Комплектность потребительской упаковки" and idx + 1 < section_end:
+                    entry["completeness"] = texts[idx + 1]
+                    idx += 2
+                elif t == "Признак включения в ЖНВЛП" and idx + 1 < section_end:
+                    idx += 2
+                    break
+                else:
+                    idx += 1
+
+            entries.append(entry)
+
+        return entries
+
+    # ------------------------------------------------------------------
+    # Multi-row: build ContractData list from parsed entries
+    # ------------------------------------------------------------------
+
+    def _build_contracts(
+        self,
+        base: ContractData,
+        object_rows: dict,
+        drug_entries: list,
+    ) -> list:
+        results = []
+
+        for entry in drug_entries:
+            data = ContractData(
+                source_file=base.source_file,
+                contract_number=base.contract_number,
+                contract_date=base.contract_date,
+                notice_number=base.notice_number,
+                procurement_method=base.procurement_method,
+                customer_short_name=base.customer_short_name,
+                supplier_short_name=base.supplier_short_name,
+            )
+
+            grls_form = entry["grls_form"]
+            obj_num = entry["obj_num"]
+
+            # --- MNN ---
+            mnn_grls = ""
+            if grls_form:
+                parts = grls_form.split(":", 1)
+                if len(parts) == 2:
+                    mnn_grls = parts[0].strip()
+
+            mnn_object = ""
+            if obj_num in object_rows:
+                mnn_object = object_rows[obj_num]["name"]
+
+            if mnn_grls and mnn_object:
+                if (
+                    mnn_grls.upper() == mnn_object.upper()
+                    or mnn_grls.upper() in mnn_object.upper()
+                    or mnn_object.upper() in mnn_grls.upper()
+                ):
+                    data.mnn = mnn_grls
+                else:
+                    data.mnn = f"{mnn_grls}, {mnn_object}"
+            elif mnn_grls:
+                data.mnn = mnn_grls
+            elif mnn_object:
+                data.mnn = mnn_object
+
+            # --- Dosage form ---
+            (
+                data.dosage_form,
+                data.dosage_form_mnn_only,
+                data.dosage_form_empty,
+                data.dosage_form_uncertain,
+            ) = self._build_dosage_form(
+                grls_form,
+                mnn_object,
+                entry["qty_in_primary"],
+                entry["qty_primary_per_consumer"],
+                entry["primary_pack_type"],
+            )
+
+            # --- Trade name ---
+            trade_name_raw = entry["trade_name_raw"]
+            if trade_name_raw:
+                match = re.match(r"^(.+?),\s*ЛП", trade_name_raw)
+                if match:
+                    data.trade_name = match.group(1).strip()
+                else:
+                    data.trade_name = trade_name_raw.split(",")[0].strip()
+
+            # --- Manufacturer: holder / producer ---
+            producer = entry["producer"]
+            holder = entry["holder"]
+            producer_clean = re.sub(r"\s*\(\d+\)\s*$", "", producer).strip()
+            if holder and producer_clean:
+                if producer_clean.upper().startswith(holder.upper()):
+                    data.manufacturer = producer_clean
+                else:
+                    data.manufacturer = f"{holder}/ {producer_clean}"
+            elif producer_clean:
+                data.manufacturer = producer_clean
+            elif holder:
+                data.manufacturer = holder
+
+            # --- Quantities (упаковки = Общее количество / потреб. ед. в упаковке) ---
+            total_qty = entry["total_qty"]
+            qty_per_consumer = entry["qty_per_consumer"]
+            qty_consumer = entry["qty_consumer"]
+
+            if qty_per_consumer > 0 and total_qty > 0:
+                data.quantity_packages = total_qty / qty_per_consumer
+            elif total_qty > 0:
+                data.quantity_packages = float(total_qty)
+
+            # Округление до целого, если результат практически целый
+            if abs(data.quantity_packages - round(data.quantity_packages)) < 1e-6:
+                data.quantity_packages = float(round(data.quantity_packages))
+
+            # Сравнение 3 источников количества -> красный при расхождении
+            qty_from_object = object_rows[obj_num]["qty"] if obj_num in object_rows else 0.0
+            qty_values = [v for v in (qty_from_object, qty_consumer, total_qty) if v > 0]
+            if len(set(round(v, 4) for v in qty_values)) > 1:
+                data.quantity_mismatch = True
+
+            # --- Price ---
+            if obj_num in object_rows:
+                data.total_price = object_rows[obj_num]["sum"]
+
+            if data.quantity_packages > 0 and data.total_price > 0:
+                data.unit_price = round(data.total_price / data.quantity_packages, 2)
+
+            results.append(data)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Common helpers
+    # ------------------------------------------------------------------
+
+    def _extract_texts(self, soup: BeautifulSoup) -> list:
         for tag in soup.find_all(["style", "script", "svg"]):
             tag.decompose()
         texts = []
@@ -77,38 +508,28 @@ class ContractParser:
                 texts.append(cleaned)
         return texts
 
-    def _find_value_after(self, texts: list[str], label: str) -> str:
-        for i, t in enumerate(texts):
-            if label in t and i + 1 < len(texts):
-                return texts[i + 1]
-        return ""
-
-    def _find_value_after_exact(self, texts: list[str], label: str) -> str:
+    def _find_value_after_exact(self, texts: list, label: str) -> str:
         for i, t in enumerate(texts):
             if t.strip() == label and i + 1 < len(texts):
                 return texts[i + 1]
         return ""
 
-    def _extract_contract_number(self, texts: list[str], data: ContractData) -> None:
-        data.contract_number = self._find_value_after_exact(
-            texts, "Номер контракта"
-        )
+    def _extract_contract_number(self, texts: list, data: ContractData) -> None:
+        data.contract_number = self._find_value_after_exact(texts, "Номер контракта")
 
-    def _extract_notice_number(self, texts: list[str], data: ContractData) -> None:
+    def _extract_notice_number(self, texts: list, data: ContractData) -> None:
         for i, t in enumerate(texts):
             if "Номер извещения" in t and i + 1 < len(texts):
                 data.notice_number = texts[i + 1]
                 break
 
-    def _extract_procurement_method(
-        self, texts: list[str], data: ContractData
-    ) -> None:
+    def _extract_procurement_method(self, texts: list, data: ContractData) -> None:
         for i, t in enumerate(texts):
             if "Способ определения поставщика" in t and i + 1 < len(texts):
                 data.procurement_method = texts[i + 1].lower()
                 break
 
-    def _extract_customer_info(self, texts: list[str], data: ContractData) -> None:
+    def _extract_customer_info(self, texts: list, data: ContractData) -> None:
         in_customer = False
         for i, t in enumerate(texts):
             if "2.1. Информация о заказчике" in t:
@@ -119,7 +540,7 @@ class ContractParser:
                 data.customer_short_name = texts[i + 1]
                 break
 
-    def _extract_supplier_info(self, texts: list[str], data: ContractData) -> None:
+    def _extract_supplier_info(self, texts: list, data: ContractData) -> None:
         in_supplier = False
         for i, t in enumerate(texts):
             if "2.2. Информация о поставщике" in t:
@@ -130,209 +551,7 @@ class ContractParser:
                 data.supplier_short_name = texts[i + 1]
                 break
 
-    def _extract_object_info(self, texts: list[str], data: ContractData) -> None:
-        for i, t in enumerate(texts):
-            if t == "Итого:" and i + 1 < len(texts):
-                price_str = texts[i + 1].replace("\u00a0", "").replace(" ", "").replace(",", ".")
-                try:
-                    data.total_price = float(price_str)
-                except ValueError:
-                    data.errors.append(f"Не удалось разобрать сумму: {texts[i + 1]}")
-                break
-
-    def _parse_qty_str(self, s: str) -> float:
-        cleaned = re.sub(r"[^\d.,]", "", s.replace("\u00a0", "").replace(" ", ""))
-        cleaned = cleaned.replace(",", ".")
-        try:
-            return float(cleaned)
-        except ValueError:
-            return 0.0
-
-    def _extract_drug_details(self, texts: list[str], data: ContractData) -> None:
-        # --- Extract MNN from object table ("Наименование объекта закупки" row) ---
-        mnn_object = ""
-        qty_object_str = ""
-        for i, t in enumerate(texts):
-            if "Наименование объекта закупки" in t:
-                # Find data row: after header row (columns 1-9), then data row
-                # Pattern: headers end with "9", then data: row_num, MNN_name, ...
-                for j in range(i + 1, min(i + 30, len(texts))):
-                    if texts[j] == "9" and j + 2 < len(texts):
-                        # j+1 = row number "1", j+2 = MNN from object table
-                        mnn_object = texts[j + 2]
-                        break
-                break
-
-        # Extract "Количество (объем) и единица измерения" from object table
-        for i, t in enumerate(texts):
-            if "Наименование объекта закупки" in t:
-                for j in range(i + 1, min(i + 30, len(texts))):
-                    if texts[j] == "9" and j + 2 < len(texts):
-                        # After 9, data row: row_num, MNN, type, code, qty_and_unit, price, vat, country, sum
-                        idx = j + 1  # row_num
-                        idx += 1  # MNN
-                        idx += 1  # type (Товар)
-                        idx += 1  # code
-                        if idx < len(texts):
-                            qty_object_str = texts[idx]
-                        break
-                break
-
-        drug_section_start = None
-        for i, t in enumerate(texts):
-            if "Дополнительная информация о лекарственном препарате" in t:
-                drug_section_start = i
-                break
-
-        if drug_section_start is None:
-            data.errors.append("Раздел с информацией о лекарственном препарате не найден")
-            if mnn_object:
-                data.mnn = mnn_object
-            return
-
-        section_texts = texts[drug_section_start:]
-
-        trade_name_raw = ""
-        grls_form = ""
-        holder = ""
-        producer = ""
-        qty_in_primary = 0
-        qty_primary_per_consumer = 0
-        qty_per_consumer = 0
-        total_qty = 0
-        qty_consumer_units = 0
-        completeness = ""
-        primary_pack_type = ""
-
-        for i, t in enumerate(section_texts):
-            if t == "Торговое наименование, номер РУ":
-                for j in range(i + 1, min(i + 20, len(section_texts))):
-                    if section_texts[j] == "6":
-                        idx = j + 1
-                        idx += 2  # skip "1" and "1"
-                        if idx < len(section_texts):
-                            trade_name_raw = section_texts[idx]
-                        if idx + 2 < len(section_texts):
-                            primary_pack_type = section_texts[idx + 2]
-                        if idx + 3 < len(section_texts):
-                            try:
-                                qty_consumer_units = int(section_texts[idx + 3])
-                            except ValueError:
-                                pass
-                        break
-
-            if "МНН и форма выпуска в соответствии с ГРЛС" in t and i + 1 < len(section_texts):
-                grls_form = section_texts[i + 1]
-
-            if t == "Наименование держателя или владельца РУ" and i + 1 < len(section_texts):
-                holder = section_texts[i + 1]
-
-            if t == "Производитель" and i + 1 < len(section_texts):
-                producer = section_texts[i + 1]
-
-            if t == "Количество лекарственных форм в первичной упаковке" and i + 1 < len(section_texts):
-                try:
-                    qty_in_primary = int(section_texts[i + 1])
-                except ValueError:
-                    pass
-
-            if t == "Количество первичных упаковок в потребительской упаковке" and i + 1 < len(section_texts):
-                try:
-                    qty_primary_per_consumer = int(section_texts[i + 1])
-                except ValueError:
-                    pass
-
-            if t == "Количество потребительских единиц в потребительской упаковке" and i + 1 < len(section_texts):
-                try:
-                    qty_per_consumer = int(section_texts[i + 1])
-                except ValueError:
-                    pass
-
-            if t == "Общее количество" and i + 1 < len(section_texts):
-                try:
-                    total_qty = int(section_texts[i + 1])
-                except ValueError:
-                    pass
-
-            if t == "Комплектность потребительской упаковки" and i + 1 < len(section_texts):
-                completeness = section_texts[i + 1]
-
-            if "4. Условия контракта" in t:
-                break
-
-        # --- 1) МНН: from both ГРЛС and object table ---
-        mnn_grls = ""
-        if grls_form:
-            parts = grls_form.split(":", 1)
-            if len(parts) == 2:
-                mnn_grls = parts[0].strip()
-
-        if mnn_grls and mnn_object:
-            if mnn_grls.upper() == mnn_object.upper():
-                data.mnn = mnn_grls
-            else:
-                data.mnn = f"{mnn_grls}, {mnn_object}"
-        elif mnn_grls:
-            data.mnn = mnn_grls
-        elif mnn_object:
-            data.mnn = mnn_object
-
-        # --- 2) Количество: compare from 3 sources ---
-        qty_from_object = self._parse_qty_str(qty_object_str) if qty_object_str else 0.0
-        qty_from_consumer = float(qty_consumer_units) if qty_consumer_units else 0.0
-        qty_from_total = float(total_qty) if total_qty else 0.0
-
-        qty_values = {}
-        if qty_from_object > 0:
-            qty_values["Объём закупки"] = qty_from_object
-        if qty_from_consumer > 0:
-            qty_values["Потреб. ед."] = qty_from_consumer
-        if qty_from_total > 0:
-            qty_values["Общее кол-во"] = qty_from_total
-
-        unique_vals = set(qty_values.values())
-        if len(unique_vals) > 1:
-            data.quantity_mismatch = True
-            parts = [f"{k}: {int(v) if v == int(v) else v}" for k, v in qty_values.items()]
-            data.quantity_all_values = ", ".join(parts)
-
-        # Calculate packages (use total_qty / qty_per_consumer as before)
-        if qty_per_consumer > 0 and total_qty > 0:
-            data.quantity_packages = total_qty / qty_per_consumer
-        elif total_qty > 0:
-            data.quantity_packages = total_qty
-
-        # --- 3) Лек. форма: ГРЛС full form + комплектность ---
-        if grls_form:
-            data.dosage_form = grls_form
-            if completeness and completeness != "~":
-                data.dosage_form += f", {completeness}"
-
-        # Extract trade name (part before comma or registration number)
-        if trade_name_raw:
-            match = re.match(r"^(.+?),\s*ЛП", trade_name_raw)
-            if match:
-                data.trade_name = match.group(1).strip()
-            else:
-                data.trade_name = trade_name_raw.split(",")[0].strip()
-
-        # Calculate unit price
-        if data.quantity_packages > 0 and data.total_price > 0:
-            data.unit_price = round(data.total_price / data.quantity_packages, 2)
-
-        # Build manufacturer string
-        producer_clean = re.sub(r"\s*\(\d+\)\s*$", "", producer).strip()
-        if holder and producer_clean:
-            if producer_clean.startswith(holder):
-                data.manufacturer = producer_clean
-            else:
-                data.manufacturer = f"{holder}/ {producer_clean}"
-        elif producer_clean:
-            data.manufacturer = producer_clean
-        elif holder:
-            data.manufacturer = holder
-
-    def _extract_contract_date(self, texts: list[str], data: ContractData) -> None:
+    def _extract_contract_date(self, texts: list, data: ContractData) -> None:
         start_date = ""
         for i, t in enumerate(texts):
             if "Дата начала исполнения контракта" in t and i + 1 < len(texts):
@@ -356,7 +575,7 @@ class ContractParser:
         if signing_dates:
             data.contract_date = signing_dates[-1]
 
-    def _parse_pdf(self, path: Path) -> ContractData:
+    def _parse_pdf(self, path: Path) -> list:
         data = ContractData(source_file=str(path))
         try:
             import pdfplumber
@@ -370,31 +589,39 @@ class ContractParser:
 
             if not full_text.strip():
                 data.errors.append(
-                    "PDF не содержит текстового слоя. "
-                    "Требуется OCR (Tesseract)."
+                    "PDF не содержит текстового слоя. Требуется OCR (Tesseract)."
                 )
-                return data
+                return [data]
 
             texts = [
                 " ".join(line.split())
                 for line in full_text.split("\n")
                 if line.strip()
             ]
-            self._extract_contract_number(texts, data)
-            self._extract_notice_number(texts, data)
-            self._extract_procurement_method(texts, data)
-            self._extract_customer_info(texts, data)
-            self._extract_supplier_info(texts, data)
-            self._extract_object_info(texts, data)
-            self._extract_drug_details(texts, data)
-            self._extract_contract_date(texts, data)
+            base = ContractData(source_file=str(path))
+            self._extract_contract_number(texts, base)
+            self._extract_notice_number(texts, base)
+            self._extract_procurement_method(texts, base)
+            self._extract_customer_info(texts, base)
+            self._extract_supplier_info(texts, base)
+            self._extract_contract_date(texts, base)
+
+            object_rows = self._parse_object_table(texts)
+            drug_entries = self._parse_drug_entries(texts)
+            if drug_entries:
+                return self._build_contracts(base, object_rows, drug_entries)
+
+            base.errors.append(
+                "Нет данных о лекарственном препарате (раздел не найден) — строка пропущена"
+            )
+            base.dosage_form_empty = True
+            return [base]
 
         except ImportError:
             data.errors.append(
-                "Модуль pdfplumber не установлен. "
-                "Установите: pip install pdfplumber"
+                "Модуль pdfplumber не установлен. Установите: pip install pdfplumber"
             )
         except Exception as e:
             data.errors.append(f"Ошибка чтения PDF: {e}")
 
-        return data
+        return [data]

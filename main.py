@@ -6,6 +6,7 @@
 
 import sys
 import os
+import subprocess
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -39,11 +40,57 @@ from excel_handler import write_contracts_to_excel, create_new_excel, get_sheet_
 SUPPORTED_EXTENSIONS = {".html", ".htm", ".pdf"}
 
 
+class FileItemWidget(QWidget):
+    """Widget for a file list item with filename and remove/status button."""
+
+    remove_clicked = pyqtSignal(str)
+
+    def __init__(self, filename: str, file_path: str, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self._exported = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
+
+        self.label = QLabel(filename)
+        self.label.setToolTip(file_path)
+        layout.addWidget(self.label, stretch=1)
+
+        self.status_btn = QPushButton("❌")
+        self.status_btn.setFixedSize(28, 28)
+        self.status_btn.setCursor(Qt.PointingHandCursor)
+        self.status_btn.setStyleSheet(
+            "QPushButton { border: none; font-size: 16px; background: transparent; }"
+            "QPushButton:hover { background-color: #ffcccc; border-radius: 4px; }"
+        )
+        self.status_btn.clicked.connect(
+            lambda: self.remove_clicked.emit(self.file_path)
+        )
+        layout.addWidget(self.status_btn)
+
+    def mark_exported(self):
+        self._exported = True
+        self.status_btn.setText("✅")
+        self.status_btn.setEnabled(False)
+        self.status_btn.setStyleSheet(
+            "QPushButton { border: none; font-size: 16px; background: transparent; }"
+        )
+
+    @property
+    def is_exported(self) -> bool:
+        return self._exported
+
+
 class FileListWidget(QListWidget):
     """Список файлов с поддержкой drag-and-drop."""
 
+    files_duplicated = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._had_duplicates = False
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -83,10 +130,13 @@ class FileListWidget(QListWidget):
         if event.mimeData().hasUrls():
             event.setDropAction(Qt.CopyAction)
             event.accept()
+            self._had_duplicates = False
             for url in event.mimeData().urls():
                 file_path = url.toLocalFile()
                 if file_path:
                     self._add_file_if_valid(file_path)
+            if self._had_duplicates:
+                self.files_duplicated.emit()
         else:
             super().dropEvent(event)
 
@@ -107,21 +157,58 @@ class FileListWidget(QListWidget):
             return False
         for i in range(self.count()):
             if self.item(i).data(Qt.UserRole) == file_path:
+                self._had_duplicates = True
                 return False
-        item = QListWidgetItem(path.name)
+        item = QListWidgetItem()
         item.setData(Qt.UserRole, file_path)
         item.setToolTip(file_path)
+        item.setSizeHint(QSize(0, 32))
         self.addItem(item)
+
+        widget = FileItemWidget(path.name, file_path)
+        widget.remove_clicked.connect(self._remove_file)
+        self.setItemWidget(item, widget)
         return True
 
-    def add_files(self, file_paths: list[str]) -> int:
+    def add_files(self, file_paths: list) -> int:
+        self._had_duplicates = False
         added = 0
         for fp in file_paths:
             if self._add_file_if_valid(fp):
                 added += 1
         return added
 
-    def get_all_paths(self) -> list[str]:
+    @property
+    def had_duplicates(self) -> bool:
+        return self._had_duplicates
+
+    def _remove_file(self, file_path: str) -> None:
+        for i in range(self.count()):
+            if self.item(i).data(Qt.UserRole) == file_path:
+                self.takeItem(i)
+                break
+
+    def mark_exported(self, file_paths: list) -> None:
+        exported_set = set(file_paths)
+        for i in range(self.count()):
+            item = self.item(i)
+            if item and item.data(Qt.UserRole) in exported_set:
+                widget = self.itemWidget(item)
+                if isinstance(widget, FileItemWidget):
+                    widget.mark_exported()
+
+    def get_unexported_paths(self) -> list:
+        paths = []
+        for i in range(self.count()):
+            item = self.item(i)
+            widget = self.itemWidget(item)
+            if isinstance(widget, FileItemWidget) and not widget.is_exported:
+                path = item.data(Qt.UserRole)
+                if path:
+                    paths.append(path)
+        return paths
+
+    def get_all_paths(self) -> list:
         paths = []
         for i in range(self.count()):
             path = self.item(i).data(Qt.UserRole)
@@ -134,13 +221,13 @@ class ProcessThread(QThread):
     """Поток для обработки файлов."""
 
     progress = pyqtSignal(int, str)
-    finished_signal = pyqtSignal(bool, str, list)
+    finished_signal = pyqtSignal(bool, str, list, list)
 
     def __init__(
         self,
-        file_paths: list[str],
+        file_paths: list,
         excel_path: str,
-        sheet_name: str | None = None,
+        sheet_name=None,
     ):
         super().__init__()
         self.file_paths = file_paths
@@ -148,9 +235,21 @@ class ProcessThread(QThread):
         self.sheet_name = sheet_name
 
     def run(self) -> None:
+        try:
+            self._do_run()
+        except Exception as e:
+            self.finished_signal.emit(
+                False,
+                f"Критическая ошибка: {e}",
+                [str(e)],
+                [],
+            )
+
+    def _do_run(self) -> None:
         parser = ContractParser()
-        contracts: list[ContractData] = []
-        errors: list[str] = []
+        contracts = []
+        errors = []
+        successful_paths = []
         total = len(self.file_paths)
 
         for idx, fp in enumerate(self.file_paths):
@@ -158,28 +257,36 @@ class ProcessThread(QThread):
                 int((idx / total) * 100),
                 f"Обработка: {Path(fp).name}",
             )
+            name = Path(fp).name
             try:
-                result = parser.parse_file(fp)
-                if result:
-                    if result.errors:
-                        for err in result.errors:
-                            errors.append(f"{Path(fp).name}: {err}")
-                    if result.contract_number:
+                results = parser.parse_file(fp)
+                if not results:
+                    errors.append(f"{name}: Неподдерживаемый формат файла")
+                    continue
+
+                file_ok = False
+                for result in results:
+                    for err in result.errors:
+                        errors.append(f"{name}: {err}")
+                    if result.contract_number and not result.is_empty:
                         contracts.append(result)
-                    else:
-                        errors.append(
-                            f"{Path(fp).name}: Не удалось извлечь номер контракта"
-                        )
-                else:
-                    errors.append(f"{Path(fp).name}: Неподдерживаемый формат файла")
+                        file_ok = True
+
+                if file_ok:
+                    successful_paths.append(fp)
+                elif not any(r.errors for r in results):
+                    errors.append(
+                        f"{name}: Не удалось извлечь номер контракта"
+                    )
             except Exception as e:
-                errors.append(f"{Path(fp).name}: {e}")
+                errors.append(f"{name}: {e}")
 
         if not contracts:
             self.finished_signal.emit(
                 False,
                 "Не удалось извлечь данные ни из одного файла.",
                 errors,
+                [],
             )
             return
 
@@ -188,7 +295,9 @@ class ProcessThread(QThread):
         success, msg = write_contracts_to_excel(
             self.excel_path, contracts, self.sheet_name
         )
-        self.finished_signal.emit(success, msg, errors)
+        self.finished_signal.emit(
+            success, msg, errors, successful_paths if success else []
+        )
 
 
 class MainWindow(QMainWindow):
@@ -235,6 +344,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(hint_label)
 
         self.file_list = FileListWidget()
+        self.file_list.files_duplicated.connect(self._on_duplicate_file)
         left_layout.addWidget(self.file_list)
 
         btn_row = QHBoxLayout()
@@ -491,6 +601,29 @@ class MainWindow(QMainWindow):
         )
         right_layout.addWidget(self.log_area)
 
+        self.btn_open_excel = QPushButton("📂 Открыть Excel")
+        self.btn_open_excel.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+            }
+        """
+        )
+        self.btn_open_excel.clicked.connect(self.open_excel)
+        right_layout.addWidget(self.btn_open_excel)
+
         right_layout.addStretch()
         main_layout.addWidget(right_group, stretch=2)
 
@@ -513,6 +646,13 @@ class MainWindow(QMainWindow):
         if files:
             added = self.file_list.add_files(files)
             self.log(f"Добавлено файлов: {added}")
+            if self.file_list.had_duplicates:
+                QMessageBox.warning(
+                    self, "Дубликат", "Такой документ уже добавлен"
+                )
+
+    def _on_duplicate_file(self) -> None:
+        QMessageBox.warning(self, "Дубликат", "Такой документ уже добавлен")
 
     def remove_selected(self) -> None:
         for item in self.file_list.selectedItems():
@@ -543,17 +683,51 @@ class MainWindow(QMainWindow):
                 path += ".xlsx"
             self.new_path_edit.setText(path)
 
+    def open_excel(self) -> None:
+        excel_path = ""
+        if self.radio_existing.isChecked():
+            excel_path = self.excel_path_edit.text().strip()
+        else:
+            excel_path = self.new_path_edit.text().strip()
+
+        if not excel_path or not Path(excel_path).exists():
+            QMessageBox.warning(
+                self,
+                "Файл не найден",
+                "Сначала укажите или создайте Excel файл.",
+            )
+            return
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(excel_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", excel_path])
+            else:
+                subprocess.Popen(["xdg-open", excel_path])
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Ошибка", f"Не удалось открыть файл: {e}"
+            )
+
     def log(self, message: str) -> None:
         self.log_area.append(message)
 
     def start_transfer(self) -> None:
-        file_paths = self.file_list.get_all_paths()
+        file_paths = self.file_list.get_unexported_paths()
         if not file_paths:
-            QMessageBox.warning(
-                self,
-                "Нет файлов",
-                "Добавьте файлы контрактов для обработки.",
-            )
+            if self.file_list.get_all_paths():
+                QMessageBox.information(
+                    self,
+                    "Все файлы выгружены",
+                    "Все файлы в списке уже были выгружены в Excel.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Нет файлов",
+                    "Добавьте файлы контрактов для обработки.",
+                )
             return
 
         if self.radio_existing.isChecked():
@@ -602,7 +776,11 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def _on_finished(
-        self, success: bool, message: str, errors: list[str]
+        self,
+        success: bool,
+        message: str,
+        errors: list,
+        successful_paths: list,
     ) -> None:
         self.progress_bar.setValue(100)
         self.btn_transfer.setEnabled(True)
@@ -615,6 +793,7 @@ class MainWindow(QMainWindow):
         if success:
             self.log(f"\n{message}")
             self.status_label.setText("Готово!")
+            self.file_list.mark_exported(successful_paths)
             QMessageBox.information(self, "Готово", message)
         else:
             self.log(f"\nОшибка: {message}")
