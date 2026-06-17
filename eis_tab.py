@@ -15,6 +15,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from eis_downloader import EISClient, parse_numbers, download_contract
 from parser_engine import ContractParser
 from excel_handler import write_contracts_to_excel, create_new_excel
+from summary_handler import write_summary
 
 
 def read_numbers_from_excel(path):
@@ -45,7 +46,7 @@ class TestThread(QThread):
 class DownloadThread(QThread):
     progress = pyqtSignal(int, str)
     item_done = pyqtSignal(str, str, str)   # number, status, message
-    finished_all = pyqtSignal(list)         # list of downloaded html paths
+    finished_all = pyqtSignal(list, list)   # htmls, summaries
 
     def __init__(self, numbers, base_dir):
         super().__init__()
@@ -62,6 +63,7 @@ class DownloadThread(QThread):
 
         seen_reestr = {}
         htmls = []
+        summaries = []
         total = max(1, len(self.numbers))
         for i, num in enumerate(self.numbers):
             self.progress.emit(int(i / total * 100), f"Обработка: {num}")
@@ -79,9 +81,11 @@ class DownloadThread(QThread):
                 seen_reestr[reestr] = num
             if res["status"] == "ok" and res.get("html"):
                 htmls.append(res["html"])
+                if res.get("summary"):
+                    summaries.append(res["summary"])
             self.item_done.emit(num, res["status"], res["message"])
         self.progress.emit(100, "")
-        self.finished_all.emit(htmls)
+        self.finished_all.emit(htmls, summaries)
 
 
 class EisTab(QWidget):
@@ -89,6 +93,8 @@ class EisTab(QWidget):
         super().__init__(parent)
         self.statuses = {}        # number -> status
         self.last_htmls = []      # пути скачанных печатных форм
+        self.last_summaries = []  # данные для сводки по ГК
+        self.summary_path = ""    # путь к сохранённой сводке
         self.on_load_to_parser = on_load_to_parser
         self.test_thread = None
         self.dl_thread = None
@@ -205,7 +211,8 @@ class EisTab(QWidget):
 
         outer.addLayout(layout)
 
-        # Большая кнопка снизу — открыть итоговый файл «кодирование»
+        # Большие кнопки снизу — открыть итоговые файлы
+        bottom = QHBoxLayout()
         self.btn_open_excel_file = QPushButton("📂 ОТКРЫТЬ EXCEL «КОДИРОВАНИЕ»")
         self.btn_open_excel_file.setMinimumHeight(52)
         self.btn_open_excel_file.setStyleSheet(
@@ -213,7 +220,17 @@ class EisTab(QWidget):
             "padding:14px;font-size:16px;font-weight:bold;} "
             "QPushButton:hover{background:#F57C00;}")
         self.btn_open_excel_file.clicked.connect(self.open_excel_file)
-        outer.addWidget(self.btn_open_excel_file)
+        bottom.addWidget(self.btn_open_excel_file)
+
+        self.btn_open_summary_file = QPushButton("📋 ОТКРЫТЬ СВОДКУ ПО ГК")
+        self.btn_open_summary_file.setMinimumHeight(52)
+        self.btn_open_summary_file.setStyleSheet(
+            "QPushButton{background:#009688;color:white;border:none;border-radius:10px;"
+            "padding:14px;font-size:16px;font-weight:bold;} "
+            "QPushButton:hover{background:#00796B;}")
+        self.btn_open_summary_file.clicked.connect(self.open_summary_file)
+        bottom.addWidget(self.btn_open_summary_file)
+        outer.addLayout(bottom)
 
     # ------- helpers -------
     def log(self, m):
@@ -226,6 +243,17 @@ class EisTab(QWidget):
                                 "Сначала укажите путь к файлу Excel и выгрузите данные "
                                 "(галка «выгрузить в Excel»).")
             return
+        self._open(path)
+
+    def open_summary_file(self):
+        path = self.summary_path
+        if not path or not Path(path).exists():
+            QMessageBox.warning(self, "Файл не найден",
+                                "Сводка по ГК ещё не создана (нужна галка «выгрузить в Excel»).")
+            return
+        self._open(path)
+
+    def _open(self, path):
         try:
             if sys.platform == "win32":
                 os.startfile(path)
@@ -235,6 +263,18 @@ class EisTab(QWidget):
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл: {e}")
+
+    def _write_summary(self, summaries):
+        if not summaries:
+            return
+        excel_path = self.excel_edit.text().strip()
+        if not excel_path:
+            return
+        sp = str(Path(excel_path).parent / "Сводка по ГК.xlsx")
+        ok, msg, saved = write_summary(sp, summaries)
+        self.log(msg)
+        if ok:
+            self.summary_path = saved
 
     def browse_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Папка для скачивания")
@@ -383,8 +423,9 @@ class EisTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка Excel", str(e))
 
-    def _on_finished(self, htmls):
+    def _on_finished(self, htmls, summaries):
         self.last_htmls = list(htmls)
+        self.last_summaries = list(summaries)
         self.progress.setValue(100)
         self.btn_download.setEnabled(True)
         self.btn_retry.setEnabled(True)
@@ -397,6 +438,7 @@ class EisTab(QWidget):
             self.load_to_parser()
         if self.chk_to_excel.isChecked() and self.last_htmls:
             self._to_excel(self.last_htmls)
+            self._write_summary(self.last_summaries)
         if not (self.chk_to_parser.isChecked() or self.chk_to_excel.isChecked()):
             QMessageBox.information(self, "Готово",
                                    f"Скачано: {ok}. Не скачалось: {err}.")

@@ -13,6 +13,7 @@ class ContractData:
     procurement_method: str = ""
     customer_short_name: str = ""
     supplier_short_name: str = ""
+    service_contract: str = ""
     mnn: str = ""
     trade_name: str = ""
     dosage_form: str = ""
@@ -59,6 +60,7 @@ class ContractParser:
         self._extract_customer_info(texts, base)
         self._extract_supplier_info(texts, base)
         self._extract_contract_date(texts, base)
+        self._extract_service_contract(texts, base)
         object_rows = self._parse_object_table(texts)
         drug_entries = self._parse_drug_entries(texts)
         if drug_entries:
@@ -224,7 +226,7 @@ class ContractParser:
             d = ContractData(source_file=base.source_file, contract_number=base.contract_number,
                 contract_date=base.contract_date, notice_number=base.notice_number,
                 procurement_method=base.procurement_method, customer_short_name=base.customer_short_name,
-                supplier_short_name=base.supplier_short_name)
+                supplier_short_name=base.supplier_short_name, service_contract=base.service_contract)
             gf = entry["grls_form"]; on = entry["obj_num"]
             mnn_grls = gf.split(":",1)[0].strip() if gf and ":" in gf else ""
             mnn_object = object_rows[on]["name"] if on in object_rows else ""
@@ -316,6 +318,19 @@ class ContractParser:
             if "3. Предмет контракта" in t: break
             if ins and t == "Сокращенное наименование" and i+1 < len(texts):
                 d.supplier_short_name = texts[i+1]; break
+
+    def _extract_service_contract(self, texts, d):
+        """ГК на услугу из п.4.3 («Дополнительная информация об адресе»)."""
+        for i, t in enumerate(texts):
+            if "Дополнительная информация об адресе" in t:
+                for j in range(i + 1, min(i + 8, len(texts))):
+                    m = re.search(
+                        r"контракта\s+от\s+(\d{2}\.\d{2}\.\d{4})\s*г\.?\s*№\s*([^\s,;]+)",
+                        texts[j])
+                    if m:
+                        d.service_contract = f"{m.group(2)} от {m.group(1)}"
+                        return
+                break
 
     def _extract_contract_date(self, texts, d):
         for i, t in enumerate(texts):

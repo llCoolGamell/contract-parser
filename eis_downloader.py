@@ -338,9 +338,33 @@ def download_contract(client, number, base_dir, log=print):
             except Exception as e:
                 log(f"  файл не скачался: {e}")
 
+    # данные для «Сводки по ГК»
+    summary = {"supplier": "", "contract": internal, "service": "",
+               "notice": "", "payment": "не найдено"}
+    try:
+        from parser_engine import ContractParser
+        cd = ContractParser().parse_file(str(html_path))
+        c0 = cd[0] if cd else None
+        if c0:
+            summary["supplier"] = c0.supplier_short_name
+            summary["service"] = c0.service_contract
+            summary["notice"] = c0.notice_number
+            if c0.contract_date:
+                summary["contract"] = f"{internal} от {c0.contract_date}"
+    except Exception as e:
+        log(f"  сводка: {e}")
+    pdfs = [f for f in saved if f.lower().endswith(".pdf")]
+    if pdfs:
+        try:
+            from summary_handler import extract_payment_line
+            summary["payment"] = extract_payment_line(folder / pdfs[0])
+        except Exception:
+            pass
+
     return {"status": "ok", "message": f"скачано файлов: {len(saved)}",
             "internal": internal, "reestr": reestr,
-            "folder": str(folder), "html": str(html_path), "files": saved}
+            "folder": str(folder), "html": str(html_path), "files": saved,
+            "summary": summary}
 
 
 def _cli():
