@@ -224,18 +224,42 @@ class EISClient:
         return "file_" + url.split("uid=")[-1][:8] + ".bin"
 
 
+def _dop_number(name):
+    """Номер доп. соглашения из имени файла ('...доп. соглашений 2' -> 2)."""
+    m = re.search(r"соглашени\w*\s*№?\s*(\d+)", name, re.I)
+    return int(m.group(1)) if m else 0
+
+
 def choose_printform_html(client, docs, log=print):
     """
-    Среди документов карточки находит HTML «Печатной формы электронного контракта»
-    самой свежей версии. Возвращает (html_text) или None.
+    Находит нужную печатную форму электронного контракта (HTML):
+    1) с приоритетом — «Печатная форма контракта с учётом доп. соглашений N»
+       с максимальным N (если есть несколько доп. соглашений);
+    2) иначе — обычная «Печатная форма электронного контракта» (свежая версия).
+    Возвращает HTML-текст или None.
     """
-    # 1) приоритет — HTML с «печатной формой» в имени
-    ordered = [d for d in docs if d[1].lower().endswith(".html") and "печатн" in d[1].lower()]
-    # 2) затем — любой HTML (вдруг назван иначе)
-    ordered += [d for d in docs if d[1].lower().endswith(".html") and d not in ordered]
+    html_docs = [(u, n) for u, n in docs if n.lower().endswith(".html")]
 
+    # 1) доп. соглашения, начиная с самого большого номера
+    dop = [(u, n) for u, n in html_docs
+           if "соглашен" in n.lower() and "доп" in n.lower()]
+    dop.sort(key=lambda d: _dop_number(d[1]), reverse=True)
+    for url, name in dop:
+        try:
+            h = client.get_text(url)
+        except Exception as e:
+            log(f"  не открылся {name}: {e}")
+            continue
+        if is_econtract_printform(h):
+            return h
+
+    # 2) обычная печатная форма электронного контракта (без доп. соглашений)
     best, best_ver = None, (-1, -1)
-    for url, name in ordered:
+    for url, name in html_docs:
+        if "соглашен" in name.lower():
+            continue
+        if "печатн" not in name.lower():
+            continue
         try:
             h = client.get_text(url)
         except Exception as e:
@@ -246,6 +270,19 @@ def choose_printform_html(client, docs, log=print):
         ver = printform_version(h)
         if ver > best_ver:
             best_ver, best = ver, h
+    if best is not None:
+        return best
+
+    # 3) запас: любой HTML-документ, оказавшийся электронным контрактом
+    for url, name in html_docs:
+        try:
+            h = client.get_text(url)
+        except Exception:
+            continue
+        if is_econtract_printform(h):
+            ver = printform_version(h)
+            if ver > best_ver:
+                best_ver, best = ver, h
     return best
 
 

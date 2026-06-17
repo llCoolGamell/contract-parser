@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Вкладка «Скачать из ЕИС» для основной программы."""
 from pathlib import Path
-from datetime import date
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit,
@@ -110,26 +109,40 @@ class EisTab(QWidget):
         self.numbers_edit.setPlaceholderText("01085-ФЛ/2026\n2745313582726000543\n...")
         lv.addWidget(self.numbers_edit)
 
-        self.btn_excel = QPushButton("Загрузить из Excel")
-        self.btn_excel.clicked.connect(self.load_excel)
-        lv.addWidget(self.btn_excel)
+        self.btn_excel_load = QPushButton("Загрузить список из Excel")
+        self.btn_excel_load.clicked.connect(self.load_excel_list)
+        lv.addWidget(self.btn_excel_load)
         layout.addWidget(left, stretch=2)
 
         # --- Центр: настройки и кнопки ---
         center = QWidget()
         cv = QVBoxLayout(center)
 
+        cv.addWidget(QLabel("Папка для скачивания:"))
         folder_row = QHBoxLayout()
         self.folder_edit = QLineEdit()
-        self.folder_edit.setPlaceholderText("Папка для сохранения...")
+        self.folder_edit.setPlaceholderText("Куда сохранять контракты...")
         folder_row.addWidget(self.folder_edit)
-        btn_folder = QPushButton("Обзор...")
-        btn_folder.clicked.connect(self.browse_folder)
-        folder_row.addWidget(btn_folder)
+        b1 = QPushButton("Обзор...")
+        b1.clicked.connect(self.browse_folder)
+        folder_row.addWidget(b1)
         cv.addLayout(folder_row)
 
-        self.chk_parse = QCheckBox("Сразу перенести в Excel после скачивания")
-        cv.addWidget(self.chk_parse)
+        cv.addWidget(QLabel("Файл Excel (для выгрузки):"))
+        excel_row = QHBoxLayout()
+        self.excel_edit = QLineEdit()
+        self.excel_edit.setPlaceholderText("Путь к .xlsx (по шаблону кодирование)...")
+        excel_row.addWidget(self.excel_edit)
+        b2 = QPushButton("Обзор...")
+        b2.clicked.connect(self.browse_excel)
+        excel_row.addWidget(b2)
+        cv.addLayout(excel_row)
+
+        self.chk_to_parser = QCheckBox("После скачивания загрузить в парсер")
+        self.chk_to_parser.setChecked(True)
+        cv.addWidget(self.chk_to_parser)
+        self.chk_to_excel = QCheckBox("И сразу выгрузить из парсера в Excel")
+        cv.addWidget(self.chk_to_excel)
 
         self.btn_test = QPushButton("ТЕСТ доступа к ЕИС")
         self.btn_test.setStyleSheet(
@@ -190,11 +203,19 @@ class EisTab(QWidget):
         self.log_area.append(m)
 
     def browse_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения")
+        d = QFileDialog.getExistingDirectory(self, "Папка для скачивания")
         if d:
             self.folder_edit.setText(d)
 
-    def load_excel(self):
+    def browse_excel(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Файл Excel для выгрузки",
+                                              "кодирование.xlsx", "Excel (*.xlsx)")
+        if path:
+            if not path.lower().endswith(".xlsx"):
+                path += ".xlsx"
+            self.excel_edit.setText(path)
+
+    def load_excel_list(self):
         path, _ = QFileDialog.getOpenFileName(self, "Excel со списком номеров", "",
                                               "Excel (*.xlsx *.xls)")
         if not path:
@@ -226,8 +247,14 @@ class EisTab(QWidget):
     def start_download(self, retry_only):
         base = self.folder_edit.text().strip()
         if not base or not Path(base).exists():
-            QMessageBox.warning(self, "Нет папки", "Укажите существующую папку для сохранения.")
+            QMessageBox.warning(self, "Нет папки", "Укажите существующую папку для скачивания.")
             return
+        # если стоит галка выгрузки в Excel — путь обязателен заранее
+        if self.chk_to_excel.isChecked() and not self.excel_edit.text().strip():
+            QMessageBox.warning(self, "Не задан Excel",
+                                "Укажите путь к файлу Excel (галка «выгрузить в Excel» стоит).")
+            return
+
         if retry_only:
             numbers = [n for n, s in self.statuses.items() if s == "error"]
             if not numbers:
@@ -287,30 +314,22 @@ class EisTab(QWidget):
     def load_to_parser(self):
         if not self.last_htmls:
             QMessageBox.information(self, "Нет данных",
-                                   "Сначала скачайте контракты — потом загрузим печатные формы в парсер.")
-            return
+                                   "Сначала скачайте контракты.")
+            return 0
         if not self.on_load_to_parser:
             QMessageBox.warning(self, "Недоступно", "Связка с парсером недоступна.")
-            return
+            return 0
         n = self.on_load_to_parser(self.last_htmls)
         self.log(f"Загружено в парсер печатных форм: {n}")
+        return n
 
-    def _on_finished(self, htmls):
-        self.last_htmls = list(htmls)
-        self.progress.setValue(100)
-        self.btn_download.setEnabled(True)
-        self.btn_retry.setEnabled(True)
-        ok = sum(1 for s in self.statuses.values() if s == "ok")
-        err = sum(1 for s in self.statuses.values() if s == "error")
-        self.log(f"Готово. Успешно: {ok}, не скачалось: {err}")
-
-        if self.chk_parse.isChecked() and self.last_htmls:
-            self._parse_to_excel(self.last_htmls)
-        else:
-            QMessageBox.information(self, "Готово",
-                                   f"Скачано: {ok}. Не скачалось: {err}.")
-
-    def _parse_to_excel(self, htmls):
+    def _to_excel(self, htmls):
+        excel_path = self.excel_edit.text().strip()
+        if not excel_path:
+            QMessageBox.warning(self, "Не задан Excel", "Укажите путь к файлу Excel.")
+            return
+        if not excel_path.lower().endswith(".xlsx"):
+            excel_path += ".xlsx"
         try:
             parser = ContractParser()
             contracts = []
@@ -321,14 +340,29 @@ class EisTab(QWidget):
             if not contracts:
                 QMessageBox.warning(self, "Excel", "Не удалось извлечь данные из скачанного.")
                 return
-            base = self.folder_edit.text().strip()
-            out = str(Path(base) / date.today().strftime("%Y-%m-%d") /
-                      ("Контракты_" + date.today().strftime("%Y-%m-%d") + ".xlsx"))
-            create_new_excel(out)
-            success, msg = write_contracts_to_excel(out, contracts)
+            ok, msg = write_contracts_to_excel(excel_path, contracts)
             self.log(msg)
-            if success:
-                QMessageBox.information(self, "Готово",
-                                       "Скачано и перенесено в Excel:\n" + out)
+            if ok:
+                QMessageBox.information(self, "Готово", "Выгружено в Excel:\n" + excel_path)
+            else:
+                QMessageBox.critical(self, "Ошибка Excel", msg)
         except Exception as e:
             QMessageBox.critical(self, "Ошибка Excel", str(e))
+
+    def _on_finished(self, htmls):
+        self.last_htmls = list(htmls)
+        self.progress.setValue(100)
+        self.btn_download.setEnabled(True)
+        self.btn_retry.setEnabled(True)
+        ok = sum(1 for s in self.statuses.values() if s == "ok")
+        err = sum(1 for s in self.statuses.values() if s == "error")
+        self.log(f"Готово. Успешно: {ok}, не скачалось: {err}")
+
+        # авто-цепочка
+        if self.chk_to_parser.isChecked() and self.last_htmls:
+            self.load_to_parser()
+        if self.chk_to_excel.isChecked() and self.last_htmls:
+            self._to_excel(self.last_htmls)
+        if not (self.chk_to_parser.isChecked() or self.chk_to_excel.isChecked()):
+            QMessageBox.information(self, "Готово",
+                                   f"Скачано: {ok}. Не скачалось: {err}.")
