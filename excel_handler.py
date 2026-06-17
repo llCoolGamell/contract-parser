@@ -4,6 +4,7 @@
 Книга: Лист1 (пусто), Лист2 (пусто), Лист3 (данные), Лист4 (справочник поставщиков).
 Лист3: строка заголовков + строка «Год фин-я 2026 / было» + строки данных.
 Проверочные столбцы P = L×J (цена×кол-во), Q = M−P (расхождение с «Общей ценой»).
+Есть защита от повторной записи одинаковых строк в один файл.
 """
 from pathlib import Path
 from openpyxl import Workbook, load_workbook
@@ -26,14 +27,13 @@ HEADER_ROW = 1
 SUBHEADER_ROW = 2          # «Год фин-я 2026 / было»
 DATA_START_ROW = 3
 
-COL_DOSAGE = 8     # H
-COL_QTY = 10       # J  (Общее кол-во)
-COL_UNIT_PRICE = 12  # L (Цена ед.)
-COL_TOTAL = 13     # M  (Общая цена)
-COL_P = 16         # P  (=L*J)
-COL_Q = 17         # Q  (=M-P)
+COL_DOSAGE = 8
+COL_QTY = 10
+COL_UNIT_PRICE = 12
+COL_TOTAL = 13
+COL_P = 16
+COL_Q = 17
 
-# Справочник поставщиков (Лист4) — как в шаблоне «кодирование»
 SUPPLIERS = [
     'АО "Р-Фарм"', 'АО "Р-Фарм"', 'АО «Фармимэкс» ', 'ООО "БСС"', 'ООО "БСС"',
     'ООО "Компания "Эталон"', 'ООО "Компания "Эталон"', 'ООО "Компания "Эталон"',
@@ -60,6 +60,16 @@ def _owner_abbreviation(n):
 
 def _qty_value(p):
     return int(p) if p == int(p) else p
+
+
+def _key_norm(v):
+    """Нормализация значения для ключа сравнения (числа -> единый вид)."""
+    if v is None:
+        return ""
+    try:
+        return repr(round(float(str(v).replace(",", ".")), 2))
+    except (ValueError, TypeError):
+        return str(v).strip()
 
 
 def contract_to_row(data):
@@ -133,7 +143,6 @@ def write_contracts_to_excel(file_path, contracts, sheet_name=None):
         if path.exists() and path.suffix.lower() == ".xlsx":
             wb = load_workbook(str(path))
             if SHEET_NAME not in wb.sheetnames:
-                # достроим недостающую структуру
                 base = _build_book()
                 for sh in base.sheetnames:
                     if sh not in wb.sheetnames:
@@ -150,12 +159,24 @@ def write_contracts_to_excel(file_path, contracts, sheet_name=None):
 
         last_row = max(ws.max_row, SUBHEADER_ROW)
 
+        # защита от дублей: ключ = №договора, МНН, торговое, лек.форма, кол-во, общая цена
+        key_cols = (4, 6, 7, 8, 10, 13)
+        existing = set()
+        for r in range(DATA_START_ROW, ws.max_row + 1):
+            existing.add(tuple(_key_norm(ws.cell(row=r, column=c).value) for c in key_cols))
+
         written = 0
+        skipped = 0
         for contract in contracts:
+            row_vals = contract_to_row(contract)
+            key = tuple(_key_norm(row_vals[c - 1]) for c in key_cols)
+            if key in existing:
+                skipped += 1
+                continue
+            existing.add(key)
             row_num = last_row + 1 + written
-            for c, value in enumerate(contract_to_row(contract), 1):
+            for c, value in enumerate(row_vals, 1):
                 ws.cell(row=row_num, column=c, value=value)
-            # проверочные формулы
             L = get_column_letter(COL_UNIT_PRICE)
             J = get_column_letter(COL_QTY)
             M = get_column_letter(COL_TOTAL)
@@ -179,7 +200,11 @@ def write_contracts_to_excel(file_path, contracts, sheet_name=None):
         if not save_path.lower().endswith(".xlsx"):
             save_path = save_path.rsplit(".", 1)[0] + ".xlsx"
         wb.save(save_path)
-        return True, f"Записано {written} строк(и) в {save_path}"
+        msg = f"Записано {written} строк(и)"
+        if skipped:
+            msg += f", пропущено дублей: {skipped}"
+        msg += f" в {save_path}"
+        return True, msg
 
     except PermissionError:
         return False, "Файл занят другой программой. Закройте Excel и повторите."

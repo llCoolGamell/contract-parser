@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """Вкладка «Скачать из ЕИС» для основной программы."""
+import os
+import sys
+import subprocess
 from pathlib import Path
 
 from PyQt5.QtWidgets import (
@@ -92,8 +95,10 @@ class EisTab(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(10)
+        layout = QHBoxLayout()
         layout.setSpacing(12)
 
         # --- Левая панель: ввод номеров ---
@@ -198,9 +203,38 @@ class EisTab(QWidget):
         rv.addWidget(self.log_area)
         layout.addWidget(right, stretch=2)
 
+        outer.addLayout(layout)
+
+        # Большая кнопка снизу — открыть итоговый файл «кодирование»
+        self.btn_open_excel_file = QPushButton("📂 ОТКРЫТЬ EXCEL «КОДИРОВАНИЕ»")
+        self.btn_open_excel_file.setMinimumHeight(52)
+        self.btn_open_excel_file.setStyleSheet(
+            "QPushButton{background:#FF9800;color:white;border:none;border-radius:10px;"
+            "padding:14px;font-size:16px;font-weight:bold;} "
+            "QPushButton:hover{background:#F57C00;}")
+        self.btn_open_excel_file.clicked.connect(self.open_excel_file)
+        outer.addWidget(self.btn_open_excel_file)
+
     # ------- helpers -------
     def log(self, m):
         self.log_area.append(m)
+
+    def open_excel_file(self):
+        path = self.excel_edit.text().strip()
+        if not path or not Path(path).exists():
+            QMessageBox.warning(self, "Файл не найден",
+                                "Сначала укажите путь к файлу Excel и выгрузите данные "
+                                "(галка «выгрузить в Excel»).")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл: {e}")
 
     def browse_folder(self):
         d = QFileDialog.getExistingDirectory(self, "Папка для скачивания")
