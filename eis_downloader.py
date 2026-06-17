@@ -340,7 +340,7 @@ def download_contract(client, number, base_dir, log=print):
 
     # данные для «Сводки по ГК»
     summary = {"supplier": "", "contract": internal, "service": "",
-               "notice": "", "payment": "не найдено"}
+               "notice": "", "payment": "не найдено", "funding": "не определено"}
     try:
         from parser_engine import ContractParser
         cd = ContractParser().parse_file(str(html_path))
@@ -356,8 +356,11 @@ def download_contract(client, number, base_dir, log=print):
     pdfs = [f for f in saved if f.lower().endswith(".pdf")]
     if pdfs:
         try:
-            from summary_handler import extract_payment_line
-            summary["payment"] = extract_payment_line(folder / pdfs[0])
+            from summary_handler import (extract_pdf_text, payment_line_from_text,
+                                         classify_funding)
+            txt = extract_pdf_text(folder / pdfs[0])
+            summary["payment"] = payment_line_from_text(txt)
+            summary["funding"] = classify_funding(txt)
         except Exception:
             pass
 

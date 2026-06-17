@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Сводный файл «Сводка по ГК»: один госконтракт = одна строка.
-Столбцы: Поставщик | № и дата ГК | ГК на услугу | № извещения | Оплата по контракту.
-Дозапись в существующий файл, без повторов (ключ — «№ и дата ГК»).
+Столбцы: Поставщик | № и дата ГК | ГК на услугу | № извещения |
+         Оплата по контракту | Источник финансирования.
+Источник определяется по тексту PDF. Дозапись без повторов (ключ — «№ и дата ГК»).
 """
 import re
 from pathlib import Path
@@ -10,27 +11,83 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-HEADERS = ["Поставщик", "№ и дата ГК", "ГК на услугу", "№ извещения", "Оплата по контракту"]
-WIDTHS = [30, 28, 28, 22, 80]
+HEADERS = ["Поставщик", "№ и дата ГК", "ГК на услугу", "№ извещения",
+           "Оплата по контракту", "Источник финансирования"]
+WIDTHS = [30, 28, 28, 22, 80, 28]
 SHEET = "Сводка"
 
 
-def extract_payment_line(pdf_path):
-    """Фраза «Оплата по контракту осуществляется … .» из PDF (до точки). Иначе 'не найдено'."""
+def extract_pdf_text(pdf_path):
+    """Весь текст PDF одной строкой (для поиска оплаты и источника). '' если не вышло."""
     try:
         from pypdf import PdfReader
     except ImportError:
-        return "не найдено"
+        return ""
     try:
         reader = PdfReader(str(pdf_path))
         full = ""
         for page in reader.pages:
             full += (page.extract_text() or "") + "\n"
-        full = " ".join(full.split())
-        m = re.search(r"(Оплата по контракту осуществляется[^.]*\.)", full)
-        return m.group(1).strip() if m else "не найдено"
+        return " ".join(full.split())
     except Exception:
+        return ""
+
+
+def payment_line_from_text(text):
+    """Фраза «Оплата по контракту осуществляется … .» (до точки). Иначе 'не найдено'."""
+    if not text:
         return "не найдено"
+    m = re.search(r"(Оплата по контракту осуществляется[^.]*\.)", text)
+    return m.group(1).strip() if m else "не найдено"
+
+
+# Источники финансирования: (короткое имя, список регэкспов)
+_FUNDING_RULES = [
+    ("федеральный", [
+        r"федеральн\w*\s+бюджет", r"бюджет\w*\s+росси",
+        r"из\s+федеральн\w*\s+бюджет", r"субвенц\w*\s+из\s+федеральн",
+    ]),
+    ("региональный", [
+        r"бюджет\w*\s+субъект", r"(областн|краев|республиканск)\w*\s+бюджет",
+        r"бюджет\w*\s+[а-яё]+ск\w+\s+(област|кра|республик)",
+        r"бюджет\w*\s+челябинск",
+    ]),
+    ("местный", [
+        r"местн\w*\s+бюджет", r"бюджет\w*\s+муниципальн", r"муниципальн\w*\s+бюджет",
+        r"бюджет\w*\s+городского\s+округа", r"бюджет\w*\s+поселени",
+    ]),
+    ("ОМС", [
+        r"\bомс\b", r"обязательного\s+медицинского\s+страхования", r"фонд\w*\s+омс",
+        r"территориальн\w*\s+фонд",
+    ]),
+    ("собственные средства", [
+        r"собственн\w*\s+средств", r"приносящ\w*\s+доход",
+    ]),
+]
+
+_LABELS = {
+    "федеральный": "Федеральный бюджет",
+    "региональный": "Региональный бюджет",
+    "местный": "Местный бюджет",
+    "ОМС": "ОМС",
+    "собственные средства": "Собственные средства",
+}
+
+
+def classify_funding(text):
+    """Определяет источник финансирования по тексту PDF (короткая категория)."""
+    if not text:
+        return "не определено"
+    low = text.lower()
+    found = []
+    for key, pats in _FUNDING_RULES:
+        if any(re.search(p, low) for p in pats):
+            found.append(key)
+    if not found:
+        return "не определено"
+    if len(found) == 1:
+        return _LABELS[found[0]]
+    return "Смешанное (" + " + ".join(found) + ")"
 
 
 def _build_book():
@@ -53,7 +110,7 @@ def _build_book():
 
 
 def write_summary(path, rows):
-    """rows: список dict {supplier, contract, service, notice, payment}."""
+    """rows: список dict {supplier, contract, service, notice, payment, funding}."""
     p = Path(path)
     try:
         if p.exists() and p.suffix.lower() == ".xlsx":
@@ -82,7 +139,8 @@ def write_summary(path, rows):
             existing.add(key)
             rn = last + 1 + written
             vals = [row.get("supplier", ""), row.get("contract", ""),
-                    row.get("service", ""), row.get("notice", ""), row.get("payment", "")]
+                    row.get("service", ""), row.get("notice", ""),
+                    row.get("payment", ""), row.get("funding", "")]
             for c, v in enumerate(vals, 1):
                 cell = ws.cell(row=rn, column=c, value=v)
                 cell.border = b

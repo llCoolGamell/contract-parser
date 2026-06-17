@@ -678,10 +678,8 @@ class MainWindow(QMainWindow):
         self.file_list.clear()
 
     def load_from_eis(self, paths) -> int:
-        """Добавляет скачанные из ЕИС печатные формы в список парсера и переключает вкладку."""
+        """Добавляет скачанные из ЕИС печатные формы в список парсера (без переключения вкладок)."""
         added = self.file_list.add_files(list(paths), source="загружен из ЕИС")
-        if hasattr(self, "tabs"):
-            self.tabs.setCurrentIndex(0)
         self.log(f"Из ЕИС добавлено в парсер: {added}")
         return added
 

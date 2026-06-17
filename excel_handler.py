@@ -127,6 +127,7 @@ def _build_book():
 
     for i, name in enumerate(SUPPLIERS, 1):
         ws4.cell(row=i, column=1, value=name)
+    wb.active = wb.sheetnames.index(SHEET_NAME)  # открывать сразу на Лист3
     return wb
 
 
@@ -195,6 +196,9 @@ def write_contracts_to_excel(file_path, contracts, sheet_name=None):
             elif contract.dosage_form_mnn_only or contract.dosage_form_uncertain:
                 ws.cell(row=row_num, column=COL_DOSAGE).fill = YELLOW_FILL
             written += 1
+
+        if SHEET_NAME in wb.sheetnames:
+            wb.active = wb.sheetnames.index(SHEET_NAME)  # открывать сразу на Лист3
 
         save_path = str(path)
         if not save_path.lower().endswith(".xlsx"):
