@@ -12,8 +12,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 HEADERS = ["Поставщик", "№ и дата ГК", "ГК на услугу", "№ извещения",
-           "Оплата по контракту", "Источник финансирования"]
-WIDTHS = [30, 28, 28, 22, 80, 28]
+           "Оплата по контракту", "Сумма по ГК", "Источник финансирования"]
+WIDTHS = [30, 28, 28, 22, 80, 18, 28]
 SHEET = "Сводка"
 
 
@@ -140,7 +140,7 @@ def write_summary(path, rows):
             rn = last + 1 + written
             vals = [row.get("supplier", ""), row.get("contract", ""),
                     row.get("service", ""), row.get("notice", ""),
-                    row.get("payment", ""), row.get("funding", "")]
+                    row.get("payment", ""), row.get("amount", ""), row.get("funding", "")]
             for c, v in enumerate(vals, 1):
                 cell = ws.cell(row=rn, column=c, value=v)
                 cell.border = b
