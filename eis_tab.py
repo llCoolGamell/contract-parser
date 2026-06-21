@@ -89,13 +89,14 @@ class DownloadThread(QThread):
 
 
 class EisTab(QWidget):
-    def __init__(self, parent=None, on_load_to_parser=None):
+    def __init__(self, parent=None, on_load_to_parser=None, on_downloaded=None):
         super().__init__(parent)
         self.statuses = {}        # number -> status
         self.last_htmls = []      # пути скачанных печатных форм
         self.last_summaries = []  # данные для сводки по ГК
         self.summary_path = ""    # путь к сохранённой сводке
         self.on_load_to_parser = on_load_to_parser
+        self.on_downloaded = on_downloaded  # колбэк для мониторинга
         self.test_thread = None
         self.dl_thread = None
         self._build_ui()
@@ -432,6 +433,15 @@ class EisTab(QWidget):
         ok = sum(1 for s in self.statuses.values() if s == "ok")
         err = sum(1 for s in self.statuses.values() if s == "error")
         self.log(f"Готово. Успешно: {ok}, не скачалось: {err}")
+
+        # авто-добавление скачанных контрактов в мониторинг
+        if self.on_downloaded and self.last_summaries:
+            pairs = [(s.get("internal") or s.get("contract", ""), s.get("reestr", ""))
+                     for s in self.last_summaries]
+            try:
+                self.on_downloaded(pairs)
+            except Exception:
+                pass
 
         # авто-цепочка
         if self.chk_to_parser.isChecked() and self.last_htmls:

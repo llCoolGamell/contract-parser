@@ -369,10 +369,26 @@ def download_contract(client, number, base_dir, log=print):
         except Exception:
             pass
 
+    summary["reestr"] = reestr
+    summary["internal"] = internal
+
     return {"status": "ok", "message": f"скачано файлов: {len(saved)}",
             "internal": internal, "reestr": reestr,
             "folder": str(folder), "html": str(html_path), "files": saved,
             "summary": summary}
+
+
+def get_dop_info(client, number):
+    """Проверка карточки на доп. соглашения. Возвращает dict с reestr/dop_count/dop_max или error."""
+    reestr = client.search_reestr(number)
+    if not reestr:
+        return {"error": "не найден в ЕИС"}
+    card = client.get_card(reestr)
+    dop_names = [n for u, n in documents_from_html(card)
+                 if "соглашен" in n.lower() and "доп" in n.lower()]
+    nums = [_dop_number(n) for n in dop_names]
+    return {"reestr": reestr, "dop_count": len(dop_names),
+            "dop_max": max(nums) if nums else 0, "names": dop_names}
 
 
 def _cli():

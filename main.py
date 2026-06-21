@@ -637,13 +637,29 @@ class MainWindow(QMainWindow):
         # --- Вкладки: парсер контрактов + скачивание из ЕИС ---
         self.tabs = QTabWidget()
         self.tabs.addTab(central, "Парсер контрактов")
+        self.monitor_tab = None
+        try:
+            from monitor_tab import MonitorTab
+            self.monitor_tab = MonitorTab()
+        except Exception as e:
+            print("Мониторинг недоступен:", e)
         try:
             from eis_tab import EisTab
-            self.tabs.addTab(EisTab(on_load_to_parser=self.load_from_eis),
+            self.tabs.addTab(EisTab(on_load_to_parser=self.load_from_eis,
+                                    on_downloaded=self._on_eis_downloaded),
                              "Скачать из ЕИС")
         except Exception as e:
             print("EIS-вкладка недоступна:", e)
+        if self.monitor_tab is not None:
+            self.tabs.addTab(self.monitor_tab, "Мониторинг")
         self.setCentralWidget(self.tabs)
+
+    def _on_eis_downloaded(self, pairs):
+        if getattr(self, "monitor_tab", None) is not None:
+            try:
+                self.monitor_tab.add_contracts(pairs)
+            except Exception as e:
+                print("monitor add error:", e)
 
     def _toggle_excel_mode(self) -> None:
         is_existing = self.radio_existing.isChecked()
