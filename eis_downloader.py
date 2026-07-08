@@ -8,8 +8,10 @@
 Тест доступа:      python eis_downloader.py test
 Скачать контракты: python eis_downloader.py "C:\\папка" 01085-ФЛ/2026 2745313582726000543
 """
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from datetime import date
 
@@ -150,12 +152,49 @@ def find_existing_folder(base_dir, folder_name):
     return None
 
 
+_CA_BUNDLE = None
+
+
+def _ca_bundle():
+    """
+    Путь к набору доверенных сертификатов: стандартный certifi + сертификаты
+    УЦ Минцифры (Russian Trusted Root/Sub CA). С 04.07.2026 zakupki.gov.ru
+    работает на отечественном сертификате, которого нет в certifi, — без этой
+    добавки requests падает с CERTIFICATE_VERIFY_FAILED.
+    Возвращает путь к склеенному файлу или True (стандартная проверка),
+    если склеить не удалось.
+    """
+    global _CA_BUNDLE
+    if _CA_BUNDLE and os.path.exists(_CA_BUNDLE):
+        return _CA_BUNDLE
+    try:
+        from russian_certs import RUSSIAN_TRUSTED_CA
+        try:
+            import certifi
+            base = Path(certifi.where()).read_text(encoding="utf-8")
+        except Exception:
+            base = ""
+        data = base.rstrip() + "\n" + RUSSIAN_TRUSTED_CA.strip() + "\n"
+        path = Path(tempfile.gettempdir()) / "contract_parser_ca_bundle.pem"
+        try:
+            path.write_text(data, encoding="utf-8")
+        except OSError:  # файл занят другим экземпляром программы
+            import uuid
+            path = Path(tempfile.gettempdir()) / f"contract_parser_ca_{uuid.uuid4().hex[:8]}.pem"
+            path.write_text(data, encoding="utf-8")
+        _CA_BUNDLE = str(path)
+        return _CA_BUNDLE
+    except Exception:
+        return True
+
+
 class EISClient:
     def __init__(self, timeout=30):
         if requests is None:
             raise RuntimeError("Не установлен модуль requests (pip install requests)")
         self.s = requests.Session()
         self.s.headers.update(HEADERS)
+        self.s.verify = _ca_bundle()
         self.timeout = timeout
 
     def _blocked(self, text):
