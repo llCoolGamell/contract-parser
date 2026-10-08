@@ -285,6 +285,8 @@ class MonitorTab(QWidget):
             store.save(self.data)
             self.refresh_table()
             self.log(f"Добавлено в мониторинг: {added}")
+        if len(nums) > added:
+            self.log(f"Уже в мониторинге, не добавлено: {len(nums) - added}")
         self.input.clear()
 
     def add_contracts(self, pairs):
@@ -295,11 +297,14 @@ class MonitorTab(QWidget):
             if store.add_contract(self.data, number, reestr):
                 added += 1
             if len(pair) >= 4 and pair[3]:
-                store.set_service(self.data, reestr or number, pair[2], pair[3])
+                store.set_service(self.data, store.find_key(self.data, number, reestr),
+                                  pair[2], pair[3])
         store.save(self.data)
         self.refresh_table()
         if added:
             self.log(f"Из ЕИС добавлено в мониторинг: {added}")
+        if len(pairs) > added:
+            self.log(f"Из ЕИС: уже в мониторинге, не добавлено: {len(pairs) - added}")
 
     def export_numbers(self):
         rows = store.list_contracts(self.data)
@@ -413,6 +418,12 @@ class MonitorTab(QWidget):
         self.refresh_table()
 
     def _on_all(self):
+        # после проверки стали известны реестровые номера — один контракт, введённый
+        # по-разному (внутренний номер и реестровый), склеиваем
+        dup = store.dedupe(self.data)
+        if dup:
+            self.log(f"Убрано дублей: {dup}")
+            self.refresh_table()
         store.save(self.data)
         self.btn_check.setEnabled(True)
         self.btn_check_sel.setEnabled(True)

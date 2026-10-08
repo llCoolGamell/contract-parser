@@ -4,6 +4,7 @@
 Файл JSON в домашней папке пользователя. Записи старше 30 дней удаляются.
 """
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -15,13 +16,61 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
+def _norm(s):
+    """Номер для сравнения: только буквы/цифры, регистр/пробелы/слэши не важны."""
+    return re.sub(r"[^0-9a-zа-яё]", "", str(s or "").lower())
+
+
+def find_key(data, number, reestr=""):
+    """Ключ уже имеющейся записи о том же контракте или None. Тот же контракт =
+    совпал реестровый номер либо номер (в любом написании); номер может быть и
+    реестровым, если его так ввели вручную."""
+    n, r = _norm(number), _norm(reestr)
+    for key, c in data["contracts"].items():
+        ids = {_norm(key), _norm(c.get("number")), _norm(c.get("reestr"))} - {""}
+        if (r and r in ids) or (n and n in ids):
+            return key
+    return None
+
+
+def dedupe(data):
+    """Склеивает записи об одном контракте (остаётся более ранняя, недостающие
+    поля берутся из дубля). Возвращает число удалённых дублей."""
+    removed = 0
+    kept = {}
+    for key, c in list(data["contracts"].items()):
+        probe = {"contracts": kept}
+        first = find_key(probe, c.get("number") or key, c.get("reestr", ""))
+        if first is None:
+            kept[key] = c
+            continue
+        base = kept[first]
+        if not base.get("last_check") and c.get("last_check"):
+            # проверенная запись ценнее непроверенной: берём её данные, дату добавления храним старую
+            c = dict(c, added=min(base.get("added") or c.get("added", ""),
+                                  c.get("added") or base.get("added", "")))
+            base, c = c, base
+            kept[first] = base
+        elif c.get("status") == "changed":
+            base["status"] = "changed"
+            base["last_event"] = c.get("last_event", base.get("last_event", ""))
+        for field in ("reestr", "service", "service_start", "service_checked"):
+            if not base.get(field) and c.get(field):
+                base[field] = c[field]
+        removed += 1
+    data["contracts"] = kept
+    return removed
+
+
 def load():
     try:
         if STORE_PATH.exists():
             with open(STORE_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and "contracts" in data:
-                return _prune(data)
+                data = _prune(data)
+                dedupe(data)
+                return data
     except Exception:
         pass
     return {"contracts": {}}
@@ -51,13 +100,16 @@ def _prune(data):
 
 
 def add_contract(data, number, reestr=""):
-    """Добавить контракт под наблюдение (если ещё нет). key = reestr или number."""
+    """Добавить контракт под наблюдение (если ещё нет). key = reestr или number.
+    Контракт, который уже есть под другим ключом (добавлен вручную по номеру, а
+    теперь пришёл из ЕИС с реестровым — или наоборот), повторно не добавляется."""
     key = reestr or number
     if not key:
         return False
-    if key in data["contracts"]:
-        # обновим отображаемый номер/реестр, если был пуст
-        c = data["contracts"][key]
+    found = find_key(data, number, reestr)
+    if found is not None:
+        # обновим реестр, если был пуст
+        c = data["contracts"][found]
         if reestr and not c.get("reestr"):
             c["reestr"] = reestr
         return False
