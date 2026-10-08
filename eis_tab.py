@@ -12,10 +12,11 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
-from eis_downloader import EISClient, parse_numbers, download_contract
+from eis_downloader import (EISClient, parse_numbers, download_contract,
+                            get_service_start)
 from parser_engine import ContractParser
 from excel_handler import write_contracts_to_excel, create_new_excel
-from summary_handler import write_summary
+from summary_handler import write_summary, backfill_service_start
 
 
 def read_numbers_from_excel(path):
@@ -43,6 +44,27 @@ class TestThread(QThread):
         self.done.emit(ok, msg)
 
 
+class BackfillThread(QThread):
+    """Дозаполнение «Действует с» в уже записанной сводке по ГК."""
+    done = pyqtSignal(bool, str, str)   # ok, сообщение, путь
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            client = EISClient()
+            cache = {}
+            ok, msg, saved = backfill_service_start(
+                self.path,
+                lambda service: get_service_start(client, service, cache,
+                                                  log=lambda m: None))
+        except Exception as e:
+            ok, msg, saved = False, f"Сводка по ГК: ошибка {e}", self.path
+        self.done.emit(ok, msg, saved)
+
+
 class DownloadThread(QThread):
     progress = pyqtSignal(int, str)
     item_done = pyqtSignal(str, str, str)   # number, status, message
@@ -62,13 +84,15 @@ class DownloadThread(QThread):
             return
 
         seen_reestr = {}
+        service_cache = {}
         htmls = []
         summaries = []
         total = max(1, len(self.numbers))
         for i, num in enumerate(self.numbers):
             self.progress.emit(int(i / total * 100), f"Обработка: {num}")
             try:
-                res = download_contract(client, num, self.base_dir, log=lambda m: None)
+                res = download_contract(client, num, self.base_dir, log=lambda m: None,
+                                        service_cache=service_cache)
             except Exception as e:
                 self.item_done.emit(num, "error", f"не скачался((( ({e})")
                 continue
@@ -99,6 +123,7 @@ class EisTab(QWidget):
         self.on_downloaded = on_downloaded  # колбэк для мониторинга
         self.test_thread = None
         self.dl_thread = None
+        self.backfill_thread = None
         self._build_ui()
 
     def _build_ui(self):
@@ -231,6 +256,20 @@ class EisTab(QWidget):
             "QPushButton:hover{background:#00796B;}")
         self.btn_open_summary_file.clicked.connect(self.open_summary_file)
         bottom.addWidget(self.btn_open_summary_file)
+
+        self.btn_backfill = QPushButton("Дозаполнить\n«Действует с»")
+        self.btn_backfill.setMinimumHeight(52)
+        self.btn_backfill.setToolTip(
+            "Найти в ЕИС дату начала действия ГК на услугу для строк сводки, "
+            "где её ещё нет, и перекрасить столбец на сегодня")
+        self.btn_backfill.setStyleSheet(
+            "QPushButton{background:#607D8B;color:white;border:none;border-radius:10px;"
+            "padding:6px 12px;font-size:11px;font-weight:bold;} "
+            "QPushButton:hover{background:#455A64;} QPushButton:disabled{background:#bbb;}")
+        self.btn_backfill.clicked.connect(self.backfill_summary)
+        bottom.addWidget(self.btn_backfill)
+        bottom.setStretch(0, 1)
+        bottom.setStretch(1, 1)
         outer.addLayout(bottom)
 
     # ------- helpers -------
@@ -264,6 +303,35 @@ class EisTab(QWidget):
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл: {e}")
+
+    def backfill_summary(self):
+        if self.backfill_thread and self.backfill_thread.isRunning():
+            return
+        path = self.summary_path
+        if not path or not Path(path).exists():
+            excel_path = self.excel_edit.text().strip()
+            guess = Path(excel_path).parent / "Сводка по ГК.xlsx" if excel_path else None
+            if guess is not None and guess.exists():
+                path = str(guess)
+            else:
+                path, _ = QFileDialog.getOpenFileName(self, "Сводка по ГК", "",
+                                                      "Excel (*.xlsx)")
+        if not path:
+            return
+        self.btn_backfill.setEnabled(False)
+        self.log(f"Дозаполнение «Действует с»: {path}")
+        self.backfill_thread = BackfillThread(path)
+        self.backfill_thread.done.connect(self._backfill_done)
+        self.backfill_thread.start()
+
+    def _backfill_done(self, ok, msg, saved):
+        self.btn_backfill.setEnabled(True)
+        self.log(msg)
+        if ok:
+            self.summary_path = saved
+            QMessageBox.information(self, "Сводка по ГК", msg)
+        else:
+            QMessageBox.critical(self, "Сводка по ГК", msg)
 
     def _write_summary(self, summaries):
         if not summaries:
@@ -436,7 +504,8 @@ class EisTab(QWidget):
 
         # авто-добавление скачанных контрактов в мониторинг
         if self.on_downloaded and self.last_summaries:
-            pairs = [(s.get("internal") or s.get("contract", ""), s.get("reestr", ""))
+            pairs = [(s.get("internal") or s.get("contract", ""), s.get("reestr", ""),
+                      s.get("service", ""), s.get("service_start", ""))
                      for s in self.last_summaries]
             try:
                 self.on_downloaded(pairs)

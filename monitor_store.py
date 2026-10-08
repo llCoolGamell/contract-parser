@@ -66,8 +66,20 @@ def add_contract(data, number, reestr=""):
         "dop_count": None, "dop_max": None,
         "last_check": "", "added": _now(),
         "status": "new", "last_event": "не проверялся",
+        "service": "", "service_start": "", "service_checked": "",
     }
     return True
+
+
+def set_service(data, key, service, service_start):
+    """ГК на услугу и дата, с которой он действует (см. «Действует с» в сводке)."""
+    c = data["contracts"].get(key)
+    if c is None:
+        return
+    if service:
+        c["service"] = service
+    c["service_start"] = service_start or ""
+    c["service_checked"] = _now()
 
 
 def remove_contract(data, key):

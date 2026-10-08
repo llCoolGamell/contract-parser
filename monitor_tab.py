@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Вкладка «Мониторинг» — отслеживание появления доп. соглашений в контрактах."""
+"""Вкладка «Мониторинг» — отслеживание появления доп. соглашений в контрактах
+и даты, с которой действует ГК на услугу (раньше неё товар принимать нельзя)."""
 import re
 import time
 import webbrowser
@@ -14,7 +15,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor
 
 import monitor_store as store
-from eis_downloader import EISClient, parse_numbers, get_dop_info
+from eis_downloader import (EISClient, parse_numbers, get_dop_info, get_service_info,
+                            get_service_start, parse_date, start_state)
 
 BASE = "https://zakupki.gov.ru"
 CARD_URL = BASE + "/epz/contract/contractCard/common-info.html?reestrNumber="
@@ -35,7 +37,21 @@ FILTERS = ["Все", "🔵 Внесены изменения", "🟢 Нет из
 _FILTER_STATUS = {FILTERS[1]: "changed", FILTERS[2]: "nochange",
                   FILTERS[3]: "new", FILTERS[4]: "error"}
 
-STATUS_COL = 3
+SERVICE_COL = 1
+START_COL = 2
+STATUS_COL = 5
+START_COLOR = {"future": "#FFC7CE", "noservice": "#FFC7CE", "ok": "#C6EFCE"}
+START_TIP = {"future": "ГК на услугу ещё не действует — принимать товар нельзя",
+             "noservice": "В контракте не указан ГК на услугу — нужен допник",
+             "ok": "ГК на услугу действует — принимать можно"}
+
+
+def _needs_service_check(c):
+    """Дату ищем, пока её нет. Нашли — больше в ЕИС за ней не ходим.
+    «Не найдено» перепроверяем не чаще раза в сутки."""
+    if parse_date(c.get("service_start")):
+        return False
+    return (c.get("service_checked") or "")[:10] != datetime.now().strftime("%Y-%m-%d")
 
 
 def _norm(s):
@@ -58,11 +74,24 @@ class CheckThread(QThread):
                 self.one_done.emit(key, {"error": str(e)})
             self.all_done.emit()
             return
-        for i, (key, number) in enumerate(self.items):
+        cache = {}
+        for i, (key, number, service) in enumerate(self.items):
             try:
                 info = get_dop_info(client, number)
             except Exception as e:
                 info = {"error": str(e)}
+            docs = info.pop("docs", [])
+            if service is not None and "error" not in info:
+                try:
+                    if service:
+                        info["service"] = service
+                        info["service_start"] = get_service_start(
+                            client, service, cache, log=lambda m: None)
+                    else:
+                        info.update(get_service_info(client, docs, cache,
+                                                     log=lambda m: None))
+                except Exception:
+                    pass  # дата не получена — попробуем при следующей проверке
             self.one_done.emit(key, info)
             if i < len(self.items) - 1:
                 time.sleep(2.0)
@@ -143,18 +172,18 @@ class MonitorTab(QWidget):
         outer.addLayout(ctl)
 
         # таблица
-        self.table = QTableWidget(0, 4)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Номер ГК", "Доп. согл.", "Последняя проверка", "Статус"])
+            ["Номер ГК", "ГК на услугу", "Действует с", "Доп. согл.",
+             "Последняя проверка", "Статус"])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.cellClicked.connect(self._on_cell_clicked)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        for col in range(1, 6):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         outer.addWidget(self.table)
 
         # действия со строками
@@ -205,11 +234,17 @@ class MonitorTab(QWidget):
             if c.get("dop_count") is not None:
                 dop = f"{c.get('dop_count')} (макс №{c.get('dop_max')})"
             status = c.get("status", "new")
-            cells = [num, dop, c.get("last_check", ""), STATUS_LABEL.get(status, status)]
+            start = c.get("service_start", "")
+            cells = [num, c.get("service", ""), start, dop, c.get("last_check", ""),
+                     STATUS_LABEL.get(status, status)]
             color = QColor(STATUS_COLOR.get(status, "#FFFFFF"))
+            state = start_state(start)
             for col, val in enumerate(cells):
                 it = QTableWidgetItem(str(val))
                 it.setBackground(color)
+                if col == START_COL and state:
+                    it.setBackground(QColor(START_COLOR[state]))
+                    it.setToolTip(START_TIP[state])
                 if col == 0:
                     it.setData(Qt.UserRole, key)
                 if col == STATUS_COL and status == "changed":
@@ -253,14 +288,17 @@ class MonitorTab(QWidget):
         self.input.clear()
 
     def add_contracts(self, pairs):
-        """Авто-добавление из ЕИС: pairs = [(number, reestr), ...]."""
+        """Авто-добавление из ЕИС: pairs = [(number, reestr[, service, service_start]), ...]."""
         added = 0
-        for number, reestr in pairs:
+        for pair in pairs:
+            number, reestr = pair[0], pair[1]
             if store.add_contract(self.data, number, reestr):
                 added += 1
+            if len(pair) >= 4 and pair[3]:
+                store.set_service(self.data, reestr or number, pair[2], pair[3])
+        store.save(self.data)
+        self.refresh_table()
         if added:
-            store.save(self.data)
-            self.refresh_table()
             self.log(f"Из ЕИС добавлено в мониторинг: {added}")
 
     def export_numbers(self):
@@ -326,8 +364,14 @@ class MonitorTab(QWidget):
         self.log(f"Интервал авто-проверки: {INTERVALS[idx][0]}")
 
     # ---------------- проверка ----------------
+    def _check_item(self, key, c):
+        """(key, номер, ГК на услугу). Третье поле: None — дату искать не надо,
+        '' — ГК на услугу ещё не известен, иначе его номер."""
+        service = c.get("service", "") if _needs_service_check(c) else None
+        return (key, c.get("number", key), service)
+
     def check_all(self):
-        items = [(key, c.get("number", key)) for key, c in store.list_contracts(self.data)]
+        items = [self._check_item(key, c) for key, c in store.list_contracts(self.data)]
         if not items:
             QMessageBox.information(self, "Мониторинг", "Список пуст — добавьте контракты.")
             return
@@ -338,7 +382,7 @@ class MonitorTab(QWidget):
         if not keys:
             QMessageBox.information(self, "Мониторинг", "Выберите строки для проверки.")
             return
-        items = [(k, self.data["contracts"][k].get("number", k)) for k in keys
+        items = [self._check_item(k, self.data["contracts"][k]) for k in keys
                  if k in self.data["contracts"]]
         self._start_check(items)
 
@@ -363,6 +407,9 @@ class MonitorTab(QWidget):
                                                info.get("dop_count", 0), info.get("dop_max", 0))
             if changed:
                 self._changed_now.append(self.data["contracts"][key].get("number", key))
+            if "service_start" in info:
+                store.set_service(self.data, key, info.get("service", ""),
+                                  info["service_start"])
         self.refresh_table()
 
     def _on_all(self):
@@ -391,6 +438,6 @@ class MonitorTab(QWidget):
             return
         if now >= self._next_check and self.data["contracts"]:
             if not (self.check_thread and self.check_thread.isRunning()):
-                items = [(key, c.get("number", key))
+                items = [self._check_item(key, c)
                          for key, c in store.list_contracts(self.data)]
                 self._start_check(items)

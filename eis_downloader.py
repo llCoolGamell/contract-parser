@@ -13,7 +13,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 
 try:
     import requests
@@ -26,6 +26,10 @@ SEARCH_URL = BASE + "/epz/contract/search/results.html"
 DOCS_URL = BASE + "/epz/contract/contractCard/document-info.html"
 
 ECONTRACT_MARKER = "Электронный контракт, сформированный с использованием ЕИС"
+
+NOT_FOUND = "не найдено"
+NO_SERVICE = "нет ГК на услугу"
+_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -73,6 +77,118 @@ def extract_internal_number(html):
     for i, t in enumerate(texts):
         if t.strip() == "Номер контракта" and i + 1 < len(texts):
             return texts[i + 1].strip()
+    return ""
+
+
+def parse_date(value):
+    """'01.10.2026' -> date. None, если это не дата."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    m = _DATE_RE.search(str(value or ""))
+    if not m:
+        return None
+    try:
+        return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
+
+
+def start_state(value, today=None):
+    """Состояние «Действует с»: 'future' — дата ещё не наступила (принимать нельзя),
+    'ok' — наступила, 'noservice' — в контракте нет ГК на услугу (нужен допник),
+    '' — даты нет."""
+    if str(value or "").strip() == NO_SERVICE:
+        return "noservice"
+    d = parse_date(value)
+    if d is None:
+        return ""
+    return "future" if d > (today or date.today()) else "ok"
+
+
+def split_service(service):
+    """'07427-РЛ/2025-2026 от 12.09.2025' -> ('07427-РЛ/2025-2026', '12.09.2025')."""
+    parts = re.split(r"\s+от\s+", (service or "").strip(), maxsplit=1)
+    number = parts[0].strip()
+    concluded = parts[1].strip() if len(parts) > 1 else ""
+    return number, concluded
+
+
+def extract_service_contract(html):
+    """ГК на услугу из печатной формы контракта на поставку (п. 4.3). '' если нет."""
+    from parser_engine import ContractParser, ContractData
+    p = ContractParser()
+    d = ContractData()
+    p._extract_service_contract(p._extract_texts(BeautifulSoup(html, "lxml")), d)
+    return d.service_contract
+
+
+def extract_start_date(html):
+    """
+    Дата начала исполнения контракта из п. 4.1 печатной формы.
+    Возвращает (дата, текст): ('01.01.2026', '') — в п. 4.1 стоит дата;
+    ('', 'с даты заключения контракта') — там текст вместо даты;
+    ('', '') — п. 4.1 в форме нет (короткая форма, условия только в PDF).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    texts = [" ".join(s.split()) for s in soup.stripped_strings if s.split()]
+    for i, t in enumerate(texts):
+        if "Дата начала исполнения контракта" in t and i + 1 < len(texts):
+            raw = texts[i + 1].strip()
+            m = _DATE_RE.match(raw)
+            return (m.group(0), "") if m else ("", raw)
+    return "", ""
+
+
+def signing_date(html):
+    """Дата заключения по печатной форме: последняя «Дата и время подписания». '' если нет."""
+    soup = BeautifulSoup(html, "lxml")
+    texts = [" ".join(s.split()) for s in soup.stripped_strings if s.split()]
+    signed = []
+    for i, t in enumerate(texts):
+        if t.startswith("Дата и время подписания"):
+            m = _DATE_RE.search(t.split(":", 1)[-1])
+            if not m and i + 1 < len(texts):
+                m = _DATE_RE.match(texts[i + 1])
+            if m:
+                signed.append(m.group(0))
+    return signed[-1] if signed else ""
+
+
+_MONTHS = {"января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+           "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11,
+           "декабря": 12}
+_ANY_DATE = (r"(?:\d{2}\.\d{2}\.\d{4}|[«\"“]?\s*\d{1,2}\s*[»\"”]?\s*(?:"
+             + "|".join(_MONTHS) + r")\s+\d{4})")
+# формулировки срока оказания услуг в тексте контракта (PDF); порядок = приоритет
+_SERVICE_PERIOD_RES = [re.compile(p, re.I) for p in (
+    r"(?:срок\w*|период\w*|начал\w*)\s+оказани\w+\s+услуг\w*[^.;]{0,200}?\bс\s+(" + _ANY_DATE + ")",
+    r"услуг\w*\s+оказыва\w+[^.;]{0,200}?\bс\s+(" + _ANY_DATE + ")",
+    r"оказани\w+\s+услуг\w*[^.;]{0,120}?\bс\s+(" + _ANY_DATE + r")\s*(?:г\.?|года)?\s*(?:по|до)\b",
+)]
+
+
+def _to_ddmmyyyy(text):
+    """'«01» октября 2026' / '01.10.2026' -> '01.10.2026'. '' если не дата."""
+    m = _DATE_RE.search(text)
+    if m:
+        return m.group(0)
+    m = re.search(r"(\d{1,2})\D{0,4}?(" + "|".join(_MONTHS) + r")\s+(\d{4})", text, re.I)
+    if not m:
+        return ""
+    return f"{int(m.group(1)):02d}.{_MONTHS[m.group(2).lower()]:02d}.{m.group(3)}"
+
+
+def find_service_period_start(text):
+    """Дата начала оказания услуг из текста контракта («Срок оказания услуг:
+    с 01.10.2026 по …», «услуги оказываются с «01» октября 2026 г.»). '' если нет."""
+    flat = " ".join((text or "").split())
+    for rx in _SERVICE_PERIOD_RES:
+        for m in rx.finditer(flat):
+            d = _to_ddmmyyyy(m.group(1))
+            if parse_date(d):
+                return d
     return ""
 
 
@@ -226,6 +342,19 @@ class EISClient:
         nums = re.findall(r"reestrNumber=(\d{15,25})", r.text)
         return nums[0] if nums else None  # первый = самый свежий (сортировка по дате)
 
+    def search_reestr_all(self, number, limit=5):
+        """Все найденные реестровые номера по порядку выдачи (без повторов)."""
+        r = self.s.get(SEARCH_URL, params=dict(SEARCH_PARAMS, searchString=number),
+                       timeout=self.timeout)
+        r.raise_for_status()
+        if self._blocked(r.text):
+            raise RuntimeError("ЕИС не пускает (антибот)")
+        out = []
+        for n in re.findall(r"reestrNumber=(\d{15,25})", r.text):
+            if n not in out:
+                out.append(n)
+        return out[:limit]
+
     def get_card(self, reestr):
         r = self.s.get(DOCS_URL, params={"reestrNumber": reestr}, timeout=self.timeout)
         r.raise_for_status()
@@ -325,7 +454,83 @@ def choose_printform_html(client, docs, log=print):
     return best
 
 
-def download_contract(client, number, base_dir, log=print):
+def _start_from_pdf(client, docs, number, log=print):
+    """Дата начала оказания услуг из PDF контракта (файл с номером контракта в имени)."""
+    from summary_handler import extract_pdf_text
+    for url, name in docs:
+        if not (name.lower().endswith(".pdf") and pdf_matches_internal(name, number)):
+            continue
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                fn = client.download(url, tmp)
+                start = find_service_period_start(extract_pdf_text(Path(tmp) / fn))
+        except Exception as e:
+            log(f"  PDF ГК на услугу не прочитан: {e}")
+            continue
+        if start:
+            return start
+    return ""
+
+
+def get_service_start(client, service, cache=None, log=print):
+    """
+    С какой даты действует ГК на услугу. Находит его в ЕИС по номеру (как обычный
+    контракт) и ищет дату по порядку:
+      1) печатная форма, п. 4.1 «Дата начала исполнения контракта» — если там дата;
+      2) текст PDF контракта — «срок оказания услуг с …» (когда в п. 4.1 текст
+         или печатная форма короткая, без условий);
+      3) если в п. 4.1 «с даты заключения контракта» и в PDF срока нет — дата
+         заключения с пометкой «(с даты заключения)», чтобы проверить глазами.
+    service — 'номер от ДД.ММ.ГГГГ' (как в столбце «ГК на услугу»).
+    cache — общий dict на серию запросов: один ГК на услугу обслуживает много
+    контрактов, повторно в ЕИС не ходим.
+    Возвращает строку с датой или NOT_FOUND. Ошибки связи пробрасываются.
+    """
+    number, concluded = split_service(service)
+    if not number:
+        return NOT_FOUND
+    key = _norm(number)
+    if cache is not None and key in cache:
+        return cache[key]
+    result = NOT_FOUND
+    for reestr in client.search_reestr_all(number):
+        docs = documents_from_html(client.get_card(reestr))
+        html = choose_printform_html(client, docs, log=log)
+        if html is not None and _norm(extract_internal_number(html)) != key:
+            continue  # в выдаче оказался другой контракт
+        start, raw = extract_start_date(html) if html else ("", "")
+        if not start:
+            start = _start_from_pdf(client, docs, number, log=log)
+        if not start and "заключени" in raw.lower():
+            d = _DATE_RE.search(concluded) if parse_date(concluded) else None
+            d = d.group(0) if d else signing_date(html)
+            if d:
+                start = f"{d} (с даты заключения)"
+        if start:
+            result = start
+            break
+        if html is not None:
+            break  # контракт тот, но даты в нём нет
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def get_service_info(client, docs, cache=None, log=print):
+    """Для мониторинга: по документам карточки контракта на поставку возвращает
+    {'service': 'номер от дата' | '',
+     'service_start': 'ДД.ММ.ГГГГ' | NOT_FOUND | NO_SERVICE}."""
+    html = choose_printform_html(client, docs, log=log)
+    if html is None:
+        return {"service": "", "service_start": NOT_FOUND}
+    service = extract_service_contract(html)
+    if not service:
+        return {"service": "", "service_start": NO_SERVICE}
+    return {"service": service,
+            "service_start": get_service_start(client, service, cache, log=log)}
+
+
+def download_contract(client, number, base_dir, log=print, service_cache=None):
     """
     Качает один контракт: печатная форма электронного контракта (HTML, имя = внутр.номер)
     + PDF контракта (по внутреннему номеру в имени).
@@ -379,6 +584,7 @@ def download_contract(client, number, base_dir, log=print):
 
     # данные для «Сводки по ГК»
     summary = {"supplier": "", "contract": internal, "service": "",
+               "service_start": NO_SERVICE,
                "notice": "", "payment": "не найдено", "amount": "",
                "funding": "не определено"}
     try:
@@ -405,8 +611,19 @@ def download_contract(client, number, base_dir, log=print):
             txt = extract_pdf_text(folder / pdfs[0])
             summary["payment"] = payment_line_from_text(txt)
             summary["funding"] = classify_funding(txt)
+            if not summary["service"]:
+                # в печатной форме ГК на услугу нет — ищем в тексте самого контракта
+                from parser_engine import find_service_contract
+                summary["service"] = find_service_contract(txt, internal)
         except Exception:
             pass
+    if summary["service"]:
+        summary["service_start"] = NOT_FOUND
+        try:
+            summary["service_start"] = get_service_start(
+                client, summary["service"], service_cache, log=log)
+        except Exception as e:
+            log(f"  ГК на услугу: {e}")
 
     summary["reestr"] = reestr
     summary["internal"] = internal
@@ -423,11 +640,12 @@ def get_dop_info(client, number):
     if not reestr:
         return {"error": "не найден в ЕИС"}
     card = client.get_card(reestr)
-    dop_names = [n for u, n in documents_from_html(card)
+    docs = documents_from_html(card)
+    dop_names = [n for u, n in docs
                  if "соглашен" in n.lower() and "доп" in n.lower()]
     nums = [_dop_number(n) for n in dop_names]
     return {"reestr": reestr, "dop_count": len(dop_names),
-            "dop_max": max(nums) if nums else 0, "names": dop_names}
+            "dop_max": max(nums) if nums else 0, "names": dop_names, "docs": docs}
 
 
 def _cli():

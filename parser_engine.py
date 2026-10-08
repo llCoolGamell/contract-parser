@@ -37,6 +37,27 @@ class ContractData:
                 and self.quantity_packages == 0 and self.total_price == 0)
 
 
+_SERVICE_DATE_NUM = re.compile(
+    r"контракт\w*\s+от\s+(\d{2}\.\d{2}\.\d{4})\s*(?:г(?:ода)?\.?)?\s*№\s*([^\s,;)]+)", re.I)
+_SERVICE_NUM_DATE = re.compile(
+    r"контракт\w*\s+№\s*([^\s,;)]+)\s+от\s+(\d{2}\.\d{2}\.\d{4})", re.I)
+_SERVICE_HINTS = ("исполнител", "фармацевтическ", "аптечн")
+
+
+def find_service_contract(text, own=""):
+    """Ищет в тексте ссылку на ГК на услугу: «контракта от ДД.ММ.ГГГГ г. №X»
+    или «контракта №X от ДД.ММ.ГГГГ». own — номер самого контракта (его не берём).
+    Возвращает 'X от ДД.ММ.ГГГГ' или ''."""
+    norm = lambda s: re.sub(r"[^0-9a-zа-яё]", "", (s or "").lower())
+    found = [(m.start(), m.group(2), m.group(1)) for m in _SERVICE_DATE_NUM.finditer(text)]
+    found += [(m.start(), m.group(1), m.group(2)) for m in _SERVICE_NUM_DATE.finditer(text)]
+    for _, number, dt in sorted(found):
+        number = number.strip(".«»\"'")
+        if number and norm(number) != norm(own):
+            return f"{number} от {dt}"
+    return ""
+
+
 class ContractParser:
     _SOLID_FORMS = ("таблет", "капсул", "драже", "пастил", "пилюл", "гранул")
 
@@ -320,17 +341,25 @@ class ContractParser:
                 d.supplier_short_name = texts[i+1]; break
 
     def _extract_service_contract(self, texts, d):
-        """ГК на услугу из п.4.3 («Дополнительная информация об адресе»)."""
+        """ГК на услугу. Обычно в п.4.3 («Дополнительная информация об адресе»),
+        но бывает в другом пункте или сноской — тогда ищем по всей форме в тексте
+        про исполнителя услуг / фармацевтическую организацию / аптечный склад."""
+        own = d.contract_number
         for i, t in enumerate(texts):
             if "Дополнительная информация об адресе" in t:
                 for j in range(i + 1, min(i + 8, len(texts))):
-                    m = re.search(
-                        r"контракта\s+от\s+(\d{2}\.\d{2}\.\d{4})\s*г\.?\s*№\s*([^\s,;]+)",
-                        texts[j])
-                    if m:
-                        d.service_contract = f"{m.group(2)} от {m.group(1)}"
+                    found = find_service_contract(texts[j], own)
+                    if found:
+                        d.service_contract = found
                         return
                 break
+        for t in texts:
+            low = t.lower()
+            if "услуг" in low and any(h in low for h in _SERVICE_HINTS):
+                found = find_service_contract(t, own)
+                if found:
+                    d.service_contract = found
+                    return
 
     def _extract_contract_date(self, texts, d):
         for i, t in enumerate(texts):
